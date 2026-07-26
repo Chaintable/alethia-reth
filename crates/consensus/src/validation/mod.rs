@@ -4,11 +4,12 @@ use std::{fmt::Debug, sync::Arc};
 use alloy_consensus::{
     BlockHeader as AlloyBlockHeader, EMPTY_OMMER_ROOT_HASH, constants::MAXIMUM_EXTRA_DATA_SIZE,
 };
+use alloy_hardforks::EthereumHardforks;
 use alloy_primitives::B256;
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator, ReceiptRootBloom};
 use reth_consensus_common::validation::{
     validate_against_parent_hash_number, validate_body_against_header, validate_header_base_fee,
-    validate_header_extra_data, validate_header_gas,
+    validate_header_extra_data, validate_header_gas, validate_shanghai_withdrawals,
 };
 use reth_ethereum_consensus::validate_block_post_execution;
 use reth_execution_types::BlockExecutionResult;
@@ -95,6 +96,11 @@ impl<B: Block> Consensus<B> for TaikoBeaconConsensus {
         body: &B::Body,
         header: &SealedHeader<B::Header>,
     ) -> Result<(), ConsensusError> {
+        validate_withdrawals_presence(
+            self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp()),
+            body.withdrawals().is_some(),
+            header.withdrawals_root().is_some(),
+        )?;
         validate_body_against_header(body, header.header())
     }
 
@@ -123,6 +129,17 @@ impl<B: Block> Consensus<B> for TaikoBeaconConsensus {
         if let Err(error) = block.ensure_transaction_root_valid() {
             return Err(ConsensusError::BodyTransactionRootDiff(error.into()));
         }
+
+        let shanghai_active = self.chain_spec.is_shanghai_active_at_timestamp(block.timestamp());
+        validate_withdrawals_presence(
+            shanghai_active,
+            block.body().withdrawals().is_some(),
+            block.withdrawals_root().is_some(),
+        )?;
+        if shanghai_active {
+            validate_shanghai_withdrawals(block)?;
+        }
+
         validate_no_blob_transactions(block.body().transactions())?;
 
         Ok(())
@@ -167,7 +184,17 @@ where
         }
 
         validate_header_gas(header)?;
-        validate_header_base_fee(header, &self.chain_spec)
+        validate_header_base_fee(header, &self.chain_spec)?;
+
+        if self.chain_spec.is_shanghai_active_at_timestamp(header.timestamp()) {
+            if header.withdrawals_root().is_none() {
+                return Err(ConsensusError::WithdrawalsRootMissing);
+            }
+        } else if header.withdrawals_root().is_some() {
+            return Err(ConsensusError::WithdrawalsRootUnexpected);
+        }
+
+        Ok(())
     }
 
     /// Validate that the header information regarding parent are correct.
@@ -309,5 +336,25 @@ fn validate_no_blob_transactions<Tx: SignedTransaction>(
     if transactions.iter().any(|tx| !is_allowed_tx_type(tx)) {
         return Err(ConsensusError::Other("Blob transactions are not allowed".into()));
     }
+    Ok(())
+}
+
+/// Validates withdrawals body/header presence for the Shanghai activation state.
+fn validate_withdrawals_presence(
+    shanghai_active: bool,
+    body_withdrawals_present: bool,
+    header_withdrawals_root_present: bool,
+) -> Result<(), ConsensusError> {
+    if shanghai_active {
+        if !body_withdrawals_present {
+            return Err(ConsensusError::BodyWithdrawalsMissing);
+        }
+        if !header_withdrawals_root_present {
+            return Err(ConsensusError::WithdrawalsRootMissing);
+        }
+    } else if body_withdrawals_present || header_withdrawals_root_present {
+        return Err(ConsensusError::WithdrawalsRootUnexpected);
+    }
+
     Ok(())
 }

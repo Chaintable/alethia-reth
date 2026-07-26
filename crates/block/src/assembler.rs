@@ -1,10 +1,7 @@
 //! Block assembler implementation for Taiko headers and block bodies.
-use alloy_consensus::{
-    BlockBody, EMPTY_OMMER_ROOT_HASH, Header, TxReceipt, constants::EMPTY_WITHDRAWALS, proofs,
-};
+use alloy_consensus::{BlockBody, EMPTY_OMMER_ROOT_HASH, Header, TxReceipt, proofs};
 use alloy_eips::{eip7685::EMPTY_REQUESTS_HASH, merge::BEACON_NONCE};
 use alloy_primitives::U256;
-use alloy_rpc_types_eth::Withdrawals;
 use reth_ethereum_primitives::{Block, Receipt, TransactionSigned, calculate_receipt_root_no_memo};
 use reth_evm::{
     block::{BlockExecutionError, BlockExecutorFactory},
@@ -56,14 +53,15 @@ where
         let receipts_root = calculate_receipt_root_no_memo(receipts);
         let logs_bloom = logs_bloom(receipts.iter().flat_map(|r| r.logs()));
 
-        let withdrawals = Some(Withdrawals::default());
-        let withdrawals_root = Some(EMPTY_WITHDRAWALS);
         let requests_hash = ctx.is_unzen_active.then_some(EMPTY_REQUESTS_HASH);
         let difficulty = if ctx.is_unzen_active {
             U256::from(ctx.finalized_block_zk_gas())
         } else {
             block_env.difficulty()
         };
+        let withdrawals = ctx.withdrawals.map(|withdrawals| withdrawals.into_owned());
+        let withdrawals_root =
+            withdrawals.as_ref().map(|withdrawals| proofs::calculate_withdrawals_root(withdrawals));
 
         let header = Header {
             parent_hash: ctx.parent_hash,
@@ -101,8 +99,12 @@ where
 #[cfg(test)]
 mod test {
     use alloy_consensus::{Header, Signed, TxLegacy};
-    use alloy_eips::eip7685::{EMPTY_REQUESTS_HASH, Requests};
+    use alloy_eips::{
+        eip4895::Withdrawal,
+        eip7685::{EMPTY_REQUESTS_HASH, Requests},
+    };
     use alloy_primitives::{Address, B256, Bytes, ChainId, Signature, TxKind, U256};
+    use alloy_rpc_types_eth::Withdrawals;
     use reth_evm::{
         EvmEnv,
         execute::{BlockAssembler, BlockAssemblerInput},
@@ -174,11 +176,17 @@ mod test {
         evm_env.block_env.timestamp = U256::from(1);
         evm_env.block_env.gas_limit = 30_000_000;
 
+        let withdrawals = Withdrawals::new(vec![Withdrawal {
+            index: 1,
+            validator_index: 2,
+            address: Address::with_last_byte(0x42),
+            amount: 3,
+        }]);
         let ctx = TaikoBlockExecutionCtx {
             parent_hash: B256::ZERO,
             parent_beacon_block_root: Some(B256::ZERO),
             ommers: &[],
-            withdrawals: None,
+            withdrawals: Some(std::borrow::Cow::Owned(withdrawals.clone())),
             basefee_per_gas: 0,
             extra_data: Bytes::default(),
             is_unzen_active: true,
@@ -212,6 +220,11 @@ mod test {
         assert_eq!(block.header.requests_hash, Some(EMPTY_REQUESTS_HASH));
         assert_eq!(block.header.blob_gas_used, Some(0));
         assert_eq!(block.header.excess_blob_gas, Some(0));
+        assert_eq!(
+            block.header.withdrawals_root,
+            Some(proofs::calculate_withdrawals_root(&withdrawals))
+        );
+        assert_eq!(block.body.withdrawals, Some(withdrawals));
     }
 
     fn sample_transaction() -> TransactionSigned {

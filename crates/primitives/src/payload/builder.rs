@@ -139,7 +139,11 @@ impl TaikoPayloadBuilderAttributes {
             parent,
             suggested_fee_recipient: attributes.payload_attributes.suggested_fee_recipient,
             prev_randao: attributes.payload_attributes.prev_randao,
-            withdrawals: attributes.payload_attributes.withdrawals.unwrap_or_default().into(),
+            withdrawals: attributes
+                .payload_attributes
+                .withdrawals
+                .ok_or(alloy_rlp::Error::Custom("missing payload attributes withdrawals"))?
+                .into(),
             parent_beacon_block_root: attributes.payload_attributes.parent_beacon_block_root,
             tx_list_hash,
             beneficiary: attributes.block_metadata.beneficiary,
@@ -353,6 +357,17 @@ mod test {
 
         assert!(attrs.transactions.is_none(), "New mode should use mempool selection");
         assert_eq!(attrs.tx_list_hash, B256::ZERO, "tx_list_hash should be zero without tx_list");
+    }
+
+    #[test]
+    fn payload_builder_attributes_reject_missing_withdrawals() {
+        let mut payload_attrs = create_payload_attrs(1000, None, 100_000_000);
+        payload_attrs.payload_attributes.withdrawals = None;
+
+        let err = TaikoPayloadBuilderAttributes::try_new(B256::ZERO, payload_attrs)
+            .expect_err("Taiko payload building must not normalize missing withdrawals to empty");
+
+        assert_eq!(err, alloy_rlp::Error::Custom("missing payload attributes withdrawals"));
     }
 
     #[test]

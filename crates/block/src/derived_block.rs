@@ -17,7 +17,7 @@ use reth_storage_api::noop::NoopProvider;
 use reth_trie_common::{HashedPostState, KeccakKeyHasher};
 
 use crate::{
-    config::{MissingBaseFee, TaikoEvmConfig, TaikoNextBlockEnvAttributes},
+    config::{MissingBaseFee, MissingWithdrawals, TaikoEvmConfig, TaikoNextBlockEnvAttributes},
     executor::TaikoBlockExecutor,
     factory::TaikoBlockExecutorFactory,
 };
@@ -43,6 +43,9 @@ fn attributes_from_derived_block(
     let base_fee_per_gas = header.base_fee_per_gas.ok_or_else(|| {
         BlockExecutionError::other(MissingBaseFee { block_number: header.number })
     })?;
+    let withdrawals = derived_block.body().withdrawals.clone().ok_or_else(|| {
+        BlockExecutionError::other(MissingWithdrawals { block_number: header.number })
+    })?;
 
     Ok(TaikoNextBlockEnvAttributes {
         timestamp: header.timestamp,
@@ -51,6 +54,7 @@ fn attributes_from_derived_block(
         gas_limit: header.gas_limit,
         extra_data: header.extra_data.clone(),
         base_fee_per_gas,
+        withdrawals,
     })
 }
 
@@ -198,7 +202,11 @@ mod tests {
                     parent_beacon_block_root: Some(B256::ZERO),
                     ..Default::default()
                 },
-                body: BlockBody { transactions, ommers: Default::default(), withdrawals: None },
+                body: BlockBody {
+                    transactions,
+                    ommers: Default::default(),
+                    withdrawals: Some(Default::default()),
+                },
             },
             senders,
         );
@@ -225,5 +233,34 @@ mod tests {
         .expect("filtered block should assemble");
 
         assert_eq!(filtered_block.body().transactions().count(), 2);
+    }
+
+    #[test]
+    fn execute_derived_block_rejects_missing_withdrawals() {
+        let config = TaikoEvmConfig::new(Arc::new(TaikoChainSpec::default()));
+        let parent_header = SealedHeader::seal_slow(Header::default());
+        let derived_block = RecoveredBlock::new_unhashed(
+            Block {
+                header: Header {
+                    number: 1,
+                    timestamp: 1,
+                    gas_limit: 30_000_000,
+                    base_fee_per_gas: Some(0),
+                    ..Default::default()
+                },
+                body: BlockBody {
+                    transactions: Vec::new(),
+                    ommers: Default::default(),
+                    withdrawals: None,
+                },
+            },
+            Vec::new(),
+        );
+
+        let err =
+            execute_derived_block(&config, &parent_header, &derived_block, db_with_contracts(&[]))
+                .expect_err("derived Taiko blocks must include withdrawals");
+
+        assert!(err.to_string().contains("missing withdrawals for Taiko block 1"));
     }
 }

@@ -281,6 +281,9 @@ mod test {
         let shasta = TAIKO_MAINNET_HARDFORKS.fork(TaikoHardfork::Shasta);
         assert!(shasta.is_timestamp(), "shasta activation should be timestamp-based");
         assert_eq!(shasta, ForkCondition::Timestamp(1_775_135_700));
+        assert!(!shasta.active_at_timestamp(1_775_135_699));
+        assert!(shasta.active_at_timestamp(1_775_135_700));
+        assert!(shasta.active_at_timestamp(1_775_135_701));
     }
 
     #[test]
@@ -288,6 +291,22 @@ mod test {
         let unzen = TAIKO_MAINNET_HARDFORKS.fork(TaikoHardfork::Unzen);
         assert!(unzen.is_timestamp(), "unzen activation should be timestamp-based");
         assert_eq!(unzen, ForkCondition::Timestamp(1_786_021_200));
+        assert!(!unzen.active_at_timestamp(1_786_021_199));
+        assert!(unzen.active_at_timestamp(1_786_021_200));
+        assert!(unzen.active_at_timestamp(1_786_021_201));
+    }
+
+    #[test]
+    fn test_mainnet_block_fork_boundaries() {
+        let ontake = TAIKO_MAINNET_HARDFORKS.fork(TaikoHardfork::Ontake);
+        assert_eq!(ontake, ForkCondition::Block(538_304));
+        assert!(!ontake.active_at_block(538_303));
+        assert!(ontake.active_at_block(538_304));
+
+        let pacaya = TAIKO_MAINNET_HARDFORKS.fork(TaikoHardfork::Pacaya);
+        assert_eq!(pacaya, ForkCondition::Block(1_166_000));
+        assert!(!pacaya.active_at_block(1_165_999));
+        assert!(pacaya.active_at_block(1_166_000));
     }
 
     #[test]

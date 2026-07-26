@@ -1,6 +1,6 @@
 //! Taiko execution payload and sidecar representations.
 use alloy_primitives::{Address, B256, Bloom, Bytes, U256};
-use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV1};
+use alloy_rpc_types_engine::{ExecutionPayload, ExecutionPayloadV1, ExecutionPayloadV2};
 use alloy_rpc_types_eth::Withdrawal;
 use reth_payload_primitives::ExecutionPayload as ExecutionPayloadTr;
 
@@ -12,6 +12,11 @@ pub struct TaikoExecutionData {
     /// Base execution payload fields returned to the engine API.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub execution_payload: TaikoExecutionPayloadV1,
+    /// Full withdrawals supplied by the Engine API.
+    ///
+    /// `None` preserves the legacy hash-only payload format, while `Some` distinguishes an
+    /// explicitly supplied list, including an empty list.
+    pub withdrawals: Option<Vec<Withdrawal>>,
     /// Taiko-specific sidecar metadata paired with the execution payload.
     #[cfg_attr(feature = "serde", serde(flatten))]
     pub taiko_sidecar: TaikoExecutionDataSidecar,
@@ -20,7 +25,13 @@ pub struct TaikoExecutionData {
 impl TaikoExecutionData {
     /// Creates a new instance of `ExecutionPayload`.
     pub fn into_payload(self) -> ExecutionPayload {
-        ExecutionPayload::V1(self.execution_payload.into())
+        let payload_inner = self.execution_payload.into();
+        match self.withdrawals {
+            Some(withdrawals) => {
+                ExecutionPayload::V2(ExecutionPayloadV2 { payload_inner, withdrawals })
+            }
+            None => ExecutionPayload::V1(payload_inner),
+        }
     }
 }
 
@@ -65,7 +76,7 @@ impl ExecutionPayloadTr for TaikoExecutionData {
 
     /// Returns the withdrawals associated with the block, if any.
     fn withdrawals(&self) -> Option<&Vec<Withdrawal>> {
-        None
+        self.withdrawals.as_ref()
     }
 
     /// Returns the access list associated with the block, if any.
@@ -188,6 +199,112 @@ impl From<TaikoExecutionPayloadV1> for ExecutionPayloadV1 {
             base_fee_per_gas: val.base_fee_per_gas,
             block_hash: val.block_hash,
             transactions: val.transactions.unwrap_or_default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn withdrawal() -> Withdrawal {
+        Withdrawal {
+            index: 1,
+            validator_index: 2,
+            address: Address::with_last_byte(0x42),
+            amount: 3,
+        }
+    }
+
+    fn driver_payload_json() -> Value {
+        json!({
+            "parentHash": B256::repeat_byte(0x01),
+            "feeRecipient": Address::with_last_byte(0x02),
+            "stateRoot": B256::repeat_byte(0x03),
+            "receiptsRoot": B256::repeat_byte(0x04),
+            "logsBloom": Bloom::ZERO,
+            "prevRandao": B256::repeat_byte(0x05),
+            "blockNumber": "0x6",
+            "gasLimit": "0x1c9c380",
+            "gasUsed": "0x5208",
+            "timestamp": "0x7",
+            "extraData": "0x",
+            "baseFeePerGas": "0x8",
+            "blockHash": B256::repeat_byte(0x09),
+            "transactions": [],
+            "txHash": B256::repeat_byte(0x0a),
+            "withdrawalsHash": B256::repeat_byte(0x0b),
+            "headerDifficulty": "0xc",
+            "taikoBlock": true
+        })
+    }
+
+    #[test]
+    fn driver_json_treats_missing_and_null_withdrawals_as_legacy_payloads() {
+        let missing: TaikoExecutionData = serde_json::from_value(driver_payload_json())
+            .expect("missing withdrawals should parse");
+
+        let mut null_json = driver_payload_json();
+        null_json
+            .as_object_mut()
+            .expect("payload should be an object")
+            .insert("withdrawals".to_string(), Value::Null);
+        let null: TaikoExecutionData =
+            serde_json::from_value(null_json).expect("null withdrawals should parse");
+
+        assert_eq!(missing.withdrawals, None);
+        assert_eq!(null.withdrawals, None);
+        assert!(ExecutionPayloadTr::withdrawals(&missing).is_none());
+        assert!(ExecutionPayloadTr::withdrawals(&null).is_none());
+        assert!(matches!(missing.into_payload(), ExecutionPayload::V1(_)));
+        assert!(matches!(null.into_payload(), ExecutionPayload::V1(_)));
+    }
+
+    #[test]
+    fn driver_json_preserves_empty_and_non_empty_withdrawals() {
+        let mut empty_json = driver_payload_json();
+        empty_json
+            .as_object_mut()
+            .expect("payload should be an object")
+            .insert("withdrawals".to_string(), json!([]));
+        let empty: TaikoExecutionData =
+            serde_json::from_value(empty_json).expect("empty withdrawals should parse");
+
+        let expected = withdrawal();
+        let mut non_empty_json = driver_payload_json();
+        non_empty_json
+            .as_object_mut()
+            .expect("payload should be an object")
+            .insert("withdrawals".to_string(), json!([expected]));
+        let non_empty: TaikoExecutionData =
+            serde_json::from_value(non_empty_json).expect("withdrawals should parse");
+
+        assert!(
+            ExecutionPayloadTr::withdrawals(&empty)
+                .expect("empty list should remain present")
+                .is_empty()
+        );
+        assert_eq!(
+            ExecutionPayloadTr::withdrawals(&non_empty)
+                .expect("withdrawals should remain present")
+                .as_slice(),
+            [expected]
+        );
+
+        let empty_json = serde_json::to_value(&empty).expect("empty withdrawals should serialize");
+        assert_eq!(empty_json["withdrawals"], json!([]));
+        let non_empty_json =
+            serde_json::to_value(&non_empty).expect("withdrawals should serialize");
+        assert_eq!(non_empty_json["withdrawals"], json!([expected]));
+
+        match empty.into_payload() {
+            ExecutionPayload::V2(payload) => assert!(payload.withdrawals.is_empty()),
+            payload => panic!("empty withdrawals must select V2, got {payload:?}"),
+        }
+        match non_empty.into_payload() {
+            ExecutionPayload::V2(payload) => assert_eq!(payload.withdrawals, vec![expected]),
+            payload => panic!("non-empty withdrawals must select V2, got {payload:?}"),
         }
     }
 }

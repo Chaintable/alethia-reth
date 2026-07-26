@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "chainId": 167013,
+  "height": 11981108,
+  "blockHash": "0x9b33c3e26bad5bbad176a1c7e8d51fc4a2d91703c851305e141e45f0e28a3993",
+  "parentHash": "0x8604b9c28098ecd4c5071f2ae3ade535cb9f8938415aac902de8ce04abd6eb6f",
+  "parentStateRoot": "0xf9ee1a55b3873382836cb96eb0b38c059012d83083a3056e93b29def19211c0b",
+  "stateRoot": "0x9855686e6f701b4fd82dc2e6fecdea4a7aa2b677cf4eb1a826b7c7b677b73665",
+  "source": {
+    "rpcUrl": "https://taiko-hoodi-rpc.publicnode.com",
+    "clientVersion": "Geth/v1.17.2-stable-b664b3bc/linux-amd64/go1.24.13",
+    "fetchedAt": "2026-07-26T11:43:10Z",
+    "blockHashesFetchedAt": "2026-07-26T11:43:10Z",
+    "blockSelection": "exact_hash_with_canonical_height_check",
+    "parentStateSelection": "eip1898_exact_parent_hash_require_canonical",
+    "blockHashSelection": "exact_number_with_parent_and_child_recheck"
+  },
+  "payloadSemantics": {
+    "rpcResultMembers": "verbatim",
+    "preserveAbsentNullAndEmpty": true,
+    "arrayOrder": "verbatim",
+    "blockHashWindow": "ascending_height_minus_256_through_parent"
+  },
+  "counts": {
+    "transactions": 1,
+    "receipts": 1,
+    "logs": 1,
+    "blockHashes": 256,
+    "accountProofs": 7,
+    "storageProofs": 5,
+    "codeQueries": 7,
+    "nonemptyCodes": 2
+  },
+  "files": {
+    "block.json": {
+      "sha256": "c680dfe4d851ba223799ef9795b43cd3725c5c97b49eab460a76720b5ff3827d",
+      "sizeBytes": 2909
+    },
+    "parent.json": {
+      "sha256": "2dde9a6a9d447845e20b2efe288432cdd6ba1c79dcde68075eedf38965b5e18a",
+      "sizeBytes": 2669
+    },
+    "block-hashes.json": {
+      "sha256": "024274a4ace9d0b1e5a8678cebbc400c1ed6976c0a55a53d3cc547f4d7696a6d",
+      "sizeBytes": 29187
+    },
+    "raw-transactions.json": {
+      "sha256": "689d94b32c705068176b309248d095de2a05b9e15c1a55e722dffc8d1c2fa779",
+      "sizeBytes": 651
+    },
+    "receipts.json": {
+      "sha256": "4e2221c9bda74bd6643dd541f7ef4ec3e518521b323ae9edf5a5631a1ab6696e",
+      "sizeBytes": 1846
+    },
+    "state-proofs.json": {
+      "sha256": "c870a1445306d3495c48064d1ccd233c5e8e52076c6a2b8fdcf1635f7f1b4284",
+      "sizeBytes": 59179
+    },
+    "codes.json": {
+      "sha256": "d02b65867be5dd44dea456983a191de731f20b5805e466188b0d3418a0230dfc",
+      "sizeBytes": 14704
+    }
+  },
+  "oracles": {
+    "blockFile": {
+      "status": "UNAVAILABLE",
+      "expectedFixture": null,
+      "reason": "No canonical blockfile exists for this height in the legacy S3 prefix, and the official RPC does not expose trace_debankBlock."
+    }
+  },
+  "validation": {
+    "status": "PASS",
+    "checks": [
+      "chain_id",
+      "canonical_block_hash",
+      "canonical_block_hash_window",
+      "parent_hash_and_state_root",
+      "child_state_receipts_and_transactions_roots",
+      "ordered_transaction_and_receipt_sets",
+      "raw_signed_transaction_hashes",
+      "eip1186_requested_key_set",
+      "parent_code_hashes",
+      "payload_sha256"
+    ]
+  },
+  "collector": {
+    "path": "scripts/collect_taiko_hoodi_unzen_fixtures.py",
+    "sha256": "01d31c305dff919991d1882f661ecb7780bcd5946317dadb37e3edf1e38f0b00",
+    "sharedPath": "scripts/collect_taiko_mainnet_fixtures.py",
+    "sharedSha256": "2f92b3336e4e3ae11d01db925fc089a2ef4e4ebf49c206931f4726de89043dc8"
+  }
+}
