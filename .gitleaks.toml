@@ -1,0 +1,12 @@
+title = "Alethia-Reth gitleaks configuration"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public EIP-1186 storage keys in frozen Taiko state-proof fixtures"
+condition = "AND"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^0x[0-9a-f]{64}$''']
+paths = ['''^crates/rpc/tests/fixtures/taiko-(mainnet|hoodi)/[0-9]+/state-proofs\.json$''']
