@@ -680,8 +680,12 @@ where
                         probe.worker_entered(block.number());
                     }
                     check_cancelled(&cancel, "before provider load")?;
+                    // Archive history serves replay reads directly; proof-history is only required
+                    // when this request will compute historical state roots.
                     let state_provider: Box<dyn StateProvider + '_> =
-                        if let Some(factory) = proof_history.as_ref() {
+                        if verify_state_roots &&
+                            let Some(factory) = proof_history.as_ref()
+                        {
                             factory.state_provider_at(canonical_state, parent_number).map_err(
                                 |error| {
                                     rpc_error(
@@ -1468,13 +1472,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_neutral_block_returns_empty_state_diff_wire() {
+    async fn root_disabled_replay_uses_archive_outside_proof_history() {
         let chain_spec = TAIKO_MAINNET.clone();
         let provider =
             MockEthProvider::<EthPrimitives>::new().with_chain_spec(chain_spec.as_ref().clone());
         let parent = empty_replay_block(0, B256::ZERO);
         let target = empty_replay_block(1, parent.hash());
-        for block in [&parent, &target] {
+        let distant_tip = empty_replay_block(2_000, B256::repeat_byte(0x20));
+        for block in [&parent, &target, &distant_tip] {
             provider.add_block(block.hash(), block.clone().into_block());
             provider.add_receipts(block.number(), vec![]);
         }
@@ -1491,7 +1496,14 @@ mod tests {
             BlockingTaskPool::builder().num_threads(1).build().unwrap(),
         ))
         .build();
-        let module = DebankTraceExt::<_, InMemoryProofsStorage>::new(eth, None, 1).into_rpc();
+        let storage: reth_optimism_trie::OpProofsStorage<InMemoryProofsStorage> =
+            InMemoryProofsStorage::new().into();
+        let proof_history = ProofHistoryStateProviderFactory::new(
+            eth.clone(),
+            storage,
+            ProofHistoryReadiness::new(),
+        );
+        let module = DebankTraceExt::new(eth, Some(proof_history), 1).into_rpc();
         let block_id = serde_json::to_string(&BlockId::number(1)).unwrap();
         let request = format!(
             r#"{{"jsonrpc":"2.0","id":1,"method":"trace_debankBlock","params":[{block_id}]}}"#
