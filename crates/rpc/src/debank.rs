@@ -376,6 +376,7 @@ pub fn format_error(result: InstructionResult, output: &[u8]) -> Result<Option<S
     }
     let message = match result {
         InstructionResult::Revert => decode_revert_reason(output)
+            .filter(|reason| !reason.is_empty())
             .map(|reason| format!("execution reverted: {reason}"))
             .unwrap_or_else(|| "execution reverted".into()),
         InstructionResult::OutOfGas |
@@ -448,7 +449,19 @@ fn decode_revert_reason(output: &[u8]) -> Option<String> {
     }
     let length = usize::try_from(U256::from_be_slice(&output[length_offset..data_offset])).ok()?;
     let end = data_offset.checked_add(length)?;
-    std::str::from_utf8(output.get(data_offset..end)?).ok().map(str::to_owned)
+    Some(decode_go_json_string(output.get(data_offset..end)?))
+}
+
+/// Decodes arbitrary Go string bytes as they appear after `encoding/json` serialization.
+fn decode_go_json_string(input: &[u8]) -> String {
+    let mut output = String::with_capacity(input.len());
+    for chunk in input.utf8_chunks() {
+        output.push_str(chunk.valid());
+        for _ in chunk.invalid() {
+            output.push(char::REPLACEMENT_CHARACTER);
+        }
+    }
+    output
 }
 
 #[derive(Clone, Debug)]
@@ -1313,6 +1326,23 @@ mod tests {
         assert_eq!(
             format_error(InstructionResult::Revert, &revert).unwrap().as_deref(),
             Some("execution reverted: X+Y>0")
+        );
+        revert[67] = 4;
+        revert[68..72].copy_from_slice(&[0xc5, b'h', b's', 0xba]);
+        assert_eq!(
+            format_error(InstructionResult::Revert, &revert).unwrap().as_deref(),
+            Some("execution reverted: �hs�")
+        );
+        revert[67] = 3;
+        revert[68..71].copy_from_slice(&[0xf1, 0x80, b'b']);
+        assert_eq!(
+            format_error(InstructionResult::Revert, &revert).unwrap().as_deref(),
+            Some("execution reverted: ��b")
+        );
+        revert[67] = 0;
+        assert_eq!(
+            format_error(InstructionResult::Revert, &revert).unwrap().as_deref(),
+            Some("execution reverted")
         );
         assert_eq!(
             format_error(InstructionResult::Revert, &[]).unwrap().as_deref(),
