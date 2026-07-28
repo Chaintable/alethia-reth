@@ -507,13 +507,17 @@ fn trace_from_node(node: &CallTraceNode, exact_error: Option<&str>) -> Result<De
     } else {
         Bytes::new()
     };
+    // Geth consumes the entire frame allowance on exceptional halts, while the inspector keeps
+    // the raw gas spent before the failing instruction.
+    let gas_used =
+        if !trace.success && !status.is_revert() { trace.gas_limit } else { trace.gas_used };
     Ok(DebankTrace {
         from_addr: trace.caller,
         gas_limit: trace.gas_limit,
         input: trace.data.clone(),
         to_addr,
         value: trace.value,
-        gas_used: trace.gas_used,
+        gas_used,
         output,
         call_create_type: kind.into(),
         call_type,
@@ -1371,30 +1375,50 @@ mod tests {
     }
 
     #[test]
-    fn formatter_clears_non_revert_failure_output() {
+    fn formatter_normalizes_exceptional_halts_and_clears_output() {
         let raw_output = Bytes::from(vec![0xde, 0xad, 0xbe, 0xef]);
 
         let mut successful = node(0, None, vec![], true);
+        successful.trace.gas_limit = 10_000;
+        successful.trace.gas_used = 4_000;
         successful.trace.output = raw_output.clone();
-        assert_eq!(trace_from_node(&successful, None).unwrap().output, raw_output);
+        let formatted = trace_from_node(&successful, None).unwrap();
+        assert_eq!(formatted.gas_used, 4_000);
+        assert_eq!(formatted.output, raw_output);
 
         let mut reverted = node(0, None, vec![], false);
+        reverted.trace.gas_limit = 10_000;
+        reverted.trace.gas_used = 4_000;
         reverted.trace.output = raw_output.clone();
-        assert_eq!(trace_from_node(&reverted, None).unwrap().output, raw_output);
+        let formatted = trace_from_node(&reverted, None).unwrap();
+        assert_eq!(formatted.gas_used, 4_000);
+        assert_eq!(formatted.output, raw_output);
+
+        let mut call_too_deep = node(0, None, vec![], false);
+        call_too_deep.trace.status = Some(InstructionResult::CallTooDeep);
+        call_too_deep.trace.gas_limit = 10_000;
+        call_too_deep.trace.gas_used = 4_000;
+        assert_eq!(trace_from_node(&call_too_deep, None).unwrap().gas_used, 4_000);
 
         let mut halted = node(0, None, vec![], false);
         halted.trace.status = Some(InstructionResult::OutOfGas);
+        halted.trace.gas_limit = 10_000;
+        halted.trace.gas_used = 4_000;
         halted.trace.output = raw_output.clone();
         let formatted = trace_from_node(&halted, None).unwrap();
         assert_eq!(formatted.error, "out of gas");
+        assert_eq!(formatted.gas_used, 10_000);
         assert!(formatted.output.is_empty());
 
         let mut code_deposit_oog = node(0, None, vec![], false);
         code_deposit_oog.trace.kind = CallKind::Create;
         code_deposit_oog.trace.status = Some(InstructionResult::OutOfGas);
+        code_deposit_oog.trace.gas_limit = 10_000;
+        code_deposit_oog.trace.gas_used = 4_000;
         code_deposit_oog.trace.output = raw_output.clone();
         let formatted = trace_from_node(&code_deposit_oog, None).unwrap();
         assert_eq!(formatted.error, "contract creation code storage out of gas");
+        assert_eq!(formatted.gas_used, 10_000);
         assert_eq!(formatted.to_addr, Address::ZERO);
         assert!(formatted.output.is_empty());
 
