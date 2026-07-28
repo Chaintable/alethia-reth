@@ -1,14 +1,16 @@
 //! Geth-compatible opcode error capture for DeBank call traces.
 
+use alethia_reth_evm::alloy::TaikoEvmContext;
 use reth_revm::{
-    Inspector,
+    Database, Inspector,
     bytecode::opcode::{self, OpCode},
+    context_interface::Host,
     interpreter::{
         CallInputs, CallOutcome, CreateInputs, CreateOutcome, InstructionResult, Interpreter,
         interpreter::EthInterpreter,
         interpreter_types::{Jumps, LoopControl, RuntimeFlag},
     },
-    primitives::hardfork::SpecId,
+    primitives::{Address, hardfork::SpecId},
 };
 
 /// Maximum stack height enforced by Geth and REVM.
@@ -30,6 +32,8 @@ struct PendingStep {
     opcode: u8,
     /// Error Geth would return before charging opcode gas.
     precheck_error: Option<String>,
+    /// Exact error for a direct cold-target gas failure, pending confirmation by `step_end`.
+    dynamic_error: Option<String>,
 }
 
 /// Sidecar inspector that preserves error context discarded by `InstructionResult`.
@@ -68,7 +72,11 @@ impl GethErrorInspector {
     }
 
     /// Captures Geth's pre-gas opcode validation for the active frame.
-    fn inspect_step(&mut self, interp: &mut Interpreter<EthInterpreter>) {
+    fn inspect_step(
+        &mut self,
+        interp: &mut Interpreter<EthInterpreter>,
+        dynamic_error: impl FnOnce(&Interpreter<EthInterpreter>) -> Option<String>,
+    ) {
         if self.frames.is_empty() {
             self.record_fault("opcode step observed without an active call/create frame");
             return;
@@ -79,13 +87,12 @@ impl GethErrorInspector {
         }
 
         let opcode = interp.bytecode.opcode();
+        let precheck_error =
+            geth_precheck_error(opcode, interp.runtime_flag.spec_id(), interp.stack.len());
         self.pending_step = Some(PendingStep {
             opcode,
-            precheck_error: geth_precheck_error(
-                opcode,
-                interp.runtime_flag.spec_id(),
-                interp.stack.len(),
-            ),
+            dynamic_error: precheck_error.is_none().then(|| dynamic_error(interp)).flatten(),
+            precheck_error,
         });
     }
 
@@ -97,7 +104,15 @@ impl GethErrorInspector {
         };
         let result = interp.bytecode.instruction_result();
 
-        if let Some(exact_error) = pending.precheck_error {
+        let exact_error = if let Some(exact_error) = pending.precheck_error {
+            Some(exact_error)
+        } else if result == Some(InstructionResult::OutOfGas) {
+            pending.dynamic_error
+        } else {
+            None
+        };
+
+        if let Some(exact_error) = exact_error {
             if !result.is_some_and(InstructionResult::is_error) {
                 self.record_fault(format!(
                     "opcode {:#x} failed Geth precheck but did not halt the frame",
@@ -185,30 +200,57 @@ impl GethErrorInspector {
     }
 }
 
-impl<CTX> Inspector<CTX, EthInterpreter> for GethErrorInspector {
+impl<DB: Database> Inspector<TaikoEvmContext<DB>, EthInterpreter> for GethErrorInspector {
     /// Captures fork and stack checks before REVM charges static opcode gas.
-    fn step(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {
-        self.inspect_step(interp);
+    fn step(
+        &mut self,
+        interp: &mut Interpreter<EthInterpreter>,
+        context: &mut TaikoEvmContext<DB>,
+    ) {
+        let warm_cost = context.gas_params().warm_storage_read_cost();
+        let cold_additional_cost = context.gas_params().cold_account_additional_cost();
+        self.inspect_step(interp, |interp| {
+            geth_dynamic_call_error(interp, warm_cost, cold_additional_cost, |target| {
+                journal_address_is_cold(context, target)
+            })
+        });
     }
 
     /// Binds a terminal precheck error to the active trace node.
-    fn step_end(&mut self, interp: &mut Interpreter<EthInterpreter>, _context: &mut CTX) {
+    fn step_end(
+        &mut self,
+        interp: &mut Interpreter<EthInterpreter>,
+        _context: &mut TaikoEvmContext<DB>,
+    ) {
         self.inspect_step_end(interp);
     }
 
     /// Mirrors `TracingInspector` call-node insertion order.
-    fn call(&mut self, _context: &mut CTX, _inputs: &mut CallInputs) -> Option<CallOutcome> {
+    fn call(
+        &mut self,
+        _context: &mut TaikoEvmContext<DB>,
+        _inputs: &mut CallInputs,
+    ) -> Option<CallOutcome> {
         self.start_frame();
         None
     }
 
     /// Completes the active call-node error record.
-    fn call_end(&mut self, _context: &mut CTX, _inputs: &CallInputs, outcome: &mut CallOutcome) {
+    fn call_end(
+        &mut self,
+        _context: &mut TaikoEvmContext<DB>,
+        _inputs: &CallInputs,
+        outcome: &mut CallOutcome,
+    ) {
         self.end_frame(outcome.result.result);
     }
 
     /// Mirrors `TracingInspector` create-node insertion order.
-    fn create(&mut self, _context: &mut CTX, _inputs: &mut CreateInputs) -> Option<CreateOutcome> {
+    fn create(
+        &mut self,
+        _context: &mut TaikoEvmContext<DB>,
+        _inputs: &mut CreateInputs,
+    ) -> Option<CreateOutcome> {
         self.start_frame();
         None
     }
@@ -216,12 +258,50 @@ impl<CTX> Inspector<CTX, EthInterpreter> for GethErrorInspector {
     /// Completes the active create-node error record.
     fn create_end(
         &mut self,
-        _context: &mut CTX,
+        _context: &mut TaikoEvmContext<DB>,
         _inputs: &CreateInputs,
         outcome: &mut CreateOutcome,
     ) {
         self.end_frame(outcome.result.result);
     }
+}
+
+/// Returns the nested Geth error for a direct cold-target charge that cannot be paid.
+///
+/// This is deliberately conservative: REVM must still report `OutOfGas` in `step_end`. It covers
+/// the primary EIP-2929 target charge, including after EIP-7702 activation, but not a later
+/// delegation-target charge.
+fn geth_dynamic_call_error(
+    interp: &Interpreter<EthInterpreter>,
+    warm_cost: u64,
+    cold_additional_cost: u64,
+    target_is_cold: impl FnOnce(Address) -> bool,
+) -> Option<String> {
+    if !interp.runtime_flag.spec_id().is_enabled_in(SpecId::BERLIN) ||
+        !matches!(
+            interp.bytecode.opcode(),
+            opcode::CALL | opcode::CALLCODE | opcode::DELEGATECALL | opcode::STATICCALL
+        )
+    {
+        return None;
+    }
+
+    let remaining_after_static = interp.gas.remaining().checked_sub(warm_cost)?;
+    if remaining_after_static >= cold_additional_cost {
+        return None;
+    }
+    let target = Address::from_word(interp.stack.peek(1).ok()?.into());
+    target_is_cold(target).then(|| "out of gas: out of gas".into())
+}
+
+/// Reproduces REVM's read-only account warmth check without loading or mutating journal state.
+fn journal_address_is_cold<DB: Database>(context: &TaikoEvmContext<DB>, address: Address) -> bool {
+    let journal = &context.journaled_state;
+    journal.warm_addresses.is_cold(&address) &&
+        journal
+            .state
+            .get(&address)
+            .is_none_or(|account| account.is_cold_transaction_id(journal.transaction_id))
 }
 
 /// Returns whether a final result requires opcode-local context for exact Geth text.
@@ -295,12 +375,12 @@ mod tests {
         },
     };
 
-    fn inspect_single_opcode(
+    fn single_opcode_interpreter(
         code: &[u8],
         spec: SpecId,
         gas_limit: u64,
         stack_len: usize,
-    ) -> (InstructionResult, String) {
+    ) -> Interpreter<EthInterpreter> {
         let bytecode = Bytecode::new_legacy(Bytes::copy_from_slice(code));
         let mut interpreter = Interpreter::<EthInterpreter>::new(
             SharedMemory::new(),
@@ -313,10 +393,19 @@ mod tests {
         for _ in 0..stack_len {
             assert!(interpreter.stack.push(U256::ZERO));
         }
+        interpreter
+    }
 
+    fn inspect_single_opcode(
+        code: &[u8],
+        spec: SpecId,
+        gas_limit: u64,
+        stack_len: usize,
+    ) -> (InstructionResult, String) {
+        let mut interpreter = single_opcode_interpreter(code, spec, gas_limit, stack_len);
         let mut inspector = GethErrorInspector::default();
         inspector.start_frame();
-        inspector.inspect_step(&mut interpreter);
+        inspector.inspect_step(&mut interpreter, |_| None);
         let mut host = DummyHost::new(spec);
         interpreter.step(&instruction_table::<EthInterpreter, DummyHost>(), &mut host);
         inspector.inspect_step_end(&mut interpreter);
@@ -365,6 +454,32 @@ mod tests {
         let (result, error) = inspect_single_opcode(&[opcode::ADD], SpecId::SHANGHAI, 0, 0);
         assert_eq!(result, InstructionResult::OutOfGas);
         assert_eq!(error, "stack underflow (0 <=> 2)");
+
+        let mut call = single_opcode_interpreter(&[opcode::CALL], SpecId::SHANGHAI, 2_599, 7);
+        assert_eq!(
+            geth_dynamic_call_error(&call, 100, 2_500, |_| true).as_deref(),
+            Some("out of gas: out of gas")
+        );
+        assert!(geth_dynamic_call_error(&call, 100, 2_500, |_| false).is_none());
+
+        let mut inspector = GethErrorInspector::default();
+        inspector.start_frame();
+        inspector
+            .inspect_step(&mut call, |call| geth_dynamic_call_error(call, 100, 2_500, |_| true));
+        call.halt(InstructionResult::OutOfGas);
+        inspector.inspect_step_end(&mut call);
+        let result = call.bytecode.instruction_result().expect("terminal call result");
+        assert_eq!(result, InstructionResult::OutOfGas);
+        inspector.end_frame(result);
+        assert_eq!(
+            inspector.finish_transaction(1).unwrap(),
+            vec![Some("out of gas: out of gas".into())]
+        );
+
+        for gas_limit in [99, 2_600] {
+            let call = single_opcode_interpreter(&[opcode::CALL], SpecId::SHANGHAI, gas_limit, 7);
+            assert!(geth_dynamic_call_error(&call, 100, 2_500, |_| true).is_none());
+        }
     }
 
     #[test]
