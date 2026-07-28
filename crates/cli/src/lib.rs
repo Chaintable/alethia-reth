@@ -51,6 +51,14 @@ pub struct TaikoCliExtArgs {
     #[command(flatten)]
     pub proof_history: TaikoProofHistoryArgs,
 
+    /// Verify parent, replay, and decoded state roots for `trace_debankBlock`.
+    #[arg(
+        long = "rpc.trace-debank-block-verify-state-roots",
+        default_value_t = false,
+        help_heading = "Taiko DeBank Trace"
+    )]
+    pub trace_debank_block_verify_state_roots: bool,
+
     /// Override the devnet Unzen hardfork activation timestamp (`0` keeps the embedded value).
     #[arg(
         long = "devnet-unzen-timestamp",
@@ -327,6 +335,19 @@ mod tests {
         unsafe { std::env::remove_var("ALETHIA_RETH_DEVNET_UNZEN_TIMESTAMP") };
 
         assert_eq!(cli.ext.devnet_unzen_timestamp, 42);
+    }
+
+    #[test]
+    fn test_trace_debank_block_state_root_verification_is_opt_in() {
+        let default = TestCli::try_parse_from(["alethia-reth"]).expect("default args should parse");
+        assert!(!default.ext.trace_debank_block_verify_state_roots);
+
+        let enabled = TestCli::try_parse_from([
+            "alethia-reth",
+            "--rpc.trace-debank-block-verify-state-roots",
+        ])
+        .expect("state-root verification flag should parse");
+        assert!(enabled.ext.trace_debank_block_verify_state_roots);
     }
 
     #[test]

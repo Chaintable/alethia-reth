@@ -581,7 +581,9 @@ async fn trace_fixture_through_handler(
         BlockingTaskPool::builder().num_threads(1).build().unwrap(),
     ))
     .build();
-    let module = DebankTraceExt::<_, InMemoryProofsStorage>::new(eth, None, 1).into_rpc();
+    let module = DebankTraceExt::<_, InMemoryProofsStorage>::new(eth, None, 1)
+        .with_state_root_verification(true)
+        .into_rpc();
     let block_id = serde_json::to_string(&alloy_eips::BlockId::hash_canonical(block.hash()))
         .expect("serialize exact canonical block id");
     let request =

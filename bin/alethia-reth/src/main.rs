@@ -36,6 +36,7 @@ fn main() {
         async move |builder, ext_args| {
             info!(target: "reth::taiko::cli", "Launching Taiko node");
             let node_builder = builder.node(TaikoNode);
+            let verify_state_roots = ext_args.trace_debank_block_verify_state_roots;
             let (node_builder, proof_history_handles) =
                 install_proof_history(node_builder, ext_args.proof_history_config())?;
             let handle = node_builder
@@ -64,6 +65,7 @@ fn main() {
                             trace_proof_history,
                             max_concurrent_replays,
                         )
+                        .with_state_root_verification(verify_state_roots)
                         .into_rpc();
                         merge_debank_trace_http_only(ctx.modules, debank_trace)?;
                     }

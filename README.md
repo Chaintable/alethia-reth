@@ -6,8 +6,9 @@
 This repository adds Chaintable's validated HTTP `trace_debankBlock` replay endpoint while
 preserving Alethia-Reth's upstream license and its lockfile-pinned Paradigm Reth dependencies.
 The endpoint replays canonical Taiko blocks with the production executor and returns the
-pipeline-compatible block file, header, and state diff only after receipt and state-root checks
-pass.
+pipeline-compatible block file, header, and state diff after receipt and block commitment checks
+pass. Historical state-root verification is disabled by default and can be enabled with
+`--rpc.trace-debank-block-verify-state-roots`.
 
 Pull request and `main` builds publish immutable commit tags to
 `public.ecr.aws/b2h7a5c4/chaintable/taiko-writer`.

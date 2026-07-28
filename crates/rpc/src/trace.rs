@@ -244,6 +244,8 @@ pub struct DebankTraceExt<Eth, Storage> {
     proof_history: Option<ProofHistoryStateProviderFactory<Eth, Storage>>,
     /// Limits concurrent DeBank replays independently from response delivery.
     replay_guard: BlockingTaskGuard,
+    /// Whether replay requests compute and verify parent and post-block state roots.
+    verify_state_roots: bool,
     /// Optional replay worker barrier used by concurrency tests.
     #[cfg(test)]
     replay_test_probe: Option<ReplayTestProbe>,
@@ -263,11 +265,18 @@ impl<Eth, Storage> DebankTraceExt<Eth, Storage> {
             eth,
             proof_history,
             replay_guard: BlockingTaskGuard::new(max_concurrent_replays),
+            verify_state_roots: false,
             #[cfg(test)]
             replay_test_probe: None,
             #[cfg(test)]
             request_timeout: DEBANK_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Configures whether replay requests compute and verify state roots.
+    pub fn with_state_root_verification(mut self, verify_state_roots: bool) -> Self {
+        self.verify_state_roots = verify_state_roots;
+        self
     }
 
     #[cfg(test)]
@@ -612,7 +621,7 @@ where
             })?
     }
 
-    /// Replays a non-Genesis block on the tracing pool and proves both state roots.
+    /// Replays a non-Genesis block on the tracing pool and optionally verifies its state roots.
     async fn replay_output(
         &self,
         block: Arc<RecoveredBlock<reth_ethereum_primitives::Block>>,
@@ -654,6 +663,7 @@ where
             ));
         }
         let proof_history = self.proof_history.clone();
+        let verify_state_roots = self.verify_state_roots;
         #[cfg(test)]
         let replay_test_probe = self.replay_test_probe.clone();
         self.eth
@@ -716,25 +726,27 @@ where
                     if let Some(probe) = replay_test_probe.as_ref() {
                         probe.phase_reached(ReplayTestPhase::ProviderLoaded);
                     }
-                    check_cancelled(&cancel, "before parent state root")?;
-                    let provider_root = state_provider
-                        .state_root(HashedPostState::default())
-                        .map_err(|error| {
-                            rpc_error(
-                                BLOCK_OR_HISTORY_UNAVAILABLE,
-                                "BLOCK_OR_HISTORY_UNAVAILABLE",
-                                error,
-                            )
-                        })?;
-                    if provider_root != parent.state_root() {
-                        return Err(rpc_error(
-                            EXECUTION_CONSENSUS_MISMATCH,
-                            "EXECUTION_CONSENSUS_MISMATCH",
-                            format!(
-                                "parent state provider root {provider_root} != parent header root {}",
-                                parent.state_root()
-                            ),
-                        ));
+                    if verify_state_roots {
+                        check_cancelled(&cancel, "before parent state root")?;
+                        let provider_root = state_provider
+                            .state_root(HashedPostState::default())
+                            .map_err(|error| {
+                                rpc_error(
+                                    BLOCK_OR_HISTORY_UNAVAILABLE,
+                                    "BLOCK_OR_HISTORY_UNAVAILABLE",
+                                    error,
+                                )
+                            })?;
+                        if provider_root != parent.state_root() {
+                            return Err(rpc_error(
+                                EXECUTION_CONSENSUS_MISMATCH,
+                                "EXECUTION_CONSENSUS_MISMATCH",
+                                format!(
+                                    "parent state provider root {provider_root} != parent header root {}",
+                                    parent.state_root()
+                                ),
+                            ));
+                        }
                     }
                     validate_block_hash_window(
                         &*state_provider,
@@ -882,29 +894,41 @@ where
 
                     state.merge_transitions(BundleRetention::PlainState);
                     let bundle = state.take_bundle();
-                    check_cancelled(&cancel, "before replay state root")?;
-                    let hashed =
-                        HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
-                    let root_a = state_provider.state_root(hashed).map_err(|error| {
-                        rpc_error(
-                            EXECUTION_CONSENSUS_MISMATCH,
-                            "EXECUTION_CONSENSUS_MISMATCH",
-                            error,
-                        )
-                    })?;
-                    if root_a != block.state_root() {
-                        return Err(rpc_error(
-                            EXECUTION_CONSENSUS_MISMATCH,
-                            "EXECUTION_CONSENSUS_MISMATCH",
-                            format!("replay root {root_a} != header root {}", block.state_root()),
-                        ));
-                    }
-                    #[cfg(test)]
-                    if let Some(probe) = replay_test_probe.as_ref() {
-                        probe.phase_reached(ReplayTestPhase::RootAComputed);
-                    }
-                    check_cancelled(&cancel, "after replay state root")?;
-                    let state_diff = build_storage_diff(&bundle, root_a, parent.state_root())
+                    let replay_root = if verify_state_roots {
+                        check_cancelled(&cancel, "before replay state root")?;
+                        let hashed =
+                            HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+                        let root = state_provider.state_root(hashed).map_err(|error| {
+                            rpc_error(
+                                EXECUTION_CONSENSUS_MISMATCH,
+                                "EXECUTION_CONSENSUS_MISMATCH",
+                                error,
+                            )
+                        })?;
+                        if root != block.state_root() {
+                            return Err(rpc_error(
+                                EXECUTION_CONSENSUS_MISMATCH,
+                                "EXECUTION_CONSENSUS_MISMATCH",
+                                format!(
+                                    "replay root {root} != header root {}",
+                                    block.state_root()
+                                ),
+                            ));
+                        }
+                        #[cfg(test)]
+                        if let Some(probe) = replay_test_probe.as_ref() {
+                            probe.phase_reached(ReplayTestPhase::RootAComputed);
+                        }
+                        check_cancelled(&cancel, "after replay state root")?;
+                        Some(root)
+                    } else {
+                        None
+                    };
+                    let state_diff = build_storage_diff(
+                        &bundle,
+                        block.state_root(),
+                        parent.state_root(),
+                    )
                         .map_err(|error| {
                             rpc_error(
                                 EXECUTION_CONSENSUS_MISMATCH,
@@ -915,7 +939,7 @@ where
                     check_cancelled(&cancel, "before state-diff encoding")?;
                     // The legacy pipeline represents a state-neutral block with empty bytes,
                     // while non-empty diffs carry their parent/current root metadata in RLP.
-                    let encoded = if root_a == parent.state_root() {
+                    let encoded = if block.state_root() == parent.state_root() {
                         Vec::new()
                     } else {
                         alloy_rlp::encode(&state_diff)
@@ -942,26 +966,28 @@ where
                     if let Some(probe) = replay_test_probe.as_ref() {
                         probe.phase_reached(ReplayTestPhase::StateDiffDecoded);
                     }
-                    check_cancelled(&cancel, "before decoded state root")?;
-                    let root_b = state_provider.state_root(decoded_state).map_err(|error| {
-                        rpc_error(
-                            EXECUTION_CONSENSUS_MISMATCH,
-                            "EXECUTION_CONSENSUS_MISMATCH",
-                            error,
-                        )
-                    })?;
-                    if root_b != root_a {
-                        return Err(rpc_error(
-                            EXECUTION_CONSENSUS_MISMATCH,
-                            "EXECUTION_CONSENSUS_MISMATCH",
-                            format!("decoded root {root_b} != replay root {root_a}"),
-                        ));
+                    if let Some(root_a) = replay_root {
+                        check_cancelled(&cancel, "before decoded state root")?;
+                        let root_b = state_provider.state_root(decoded_state).map_err(|error| {
+                            rpc_error(
+                                EXECUTION_CONSENSUS_MISMATCH,
+                                "EXECUTION_CONSENSUS_MISMATCH",
+                                error,
+                            )
+                        })?;
+                        if root_b != root_a {
+                            return Err(rpc_error(
+                                EXECUTION_CONSENSUS_MISMATCH,
+                                "EXECUTION_CONSENSUS_MISMATCH",
+                                format!("decoded root {root_b} != replay root {root_a}"),
+                            ));
+                        }
+                        #[cfg(test)]
+                        if let Some(probe) = replay_test_probe.as_ref() {
+                            probe.phase_reached(ReplayTestPhase::RootBComputed);
+                        }
+                        check_cancelled(&cancel, "after decoded state root")?;
                     }
-                    #[cfg(test)]
-                    if let Some(probe) = replay_test_probe.as_ref() {
-                        probe.phase_reached(ReplayTestPhase::RootBComputed);
-                    }
-                    check_cancelled(&cancel, "after decoded state root")?;
 
                     let mut block_file = BlockFile {
                         block: DebankBlock::from(block.as_ref()),
@@ -1452,9 +1478,10 @@ mod tests {
             provider.add_block(block.hash(), block.clone().into_block());
             provider.add_receipts(block.number(), vec![]);
         }
+        provider.state_roots.lock().extend([B256::repeat_byte(0xee); 3]);
         let cache = cache_replay_blocks(&provider, vec![target]).await;
         let eth = EthApiBuilder::new(
-            provider,
+            provider.clone(),
             testing_pool(),
             NoopNetwork::default(),
             TaikoEvmConfig::new(chain_spec),
@@ -1478,6 +1505,11 @@ mod tests {
         let response: serde_json::Value = serde_json::from_str(raw_response.get()).unwrap();
         assert_eq!(response["result"]["state_diff"], "0x", "{response:#}");
         assert!(response.get("error").is_none());
+        assert_eq!(
+            provider.state_roots.lock().len(),
+            3,
+            "state-root verification must be disabled by default"
+        );
     }
 
     #[tokio::test]
@@ -1793,6 +1825,7 @@ mod tests {
         .with_resources(resources.clone());
         let tracer = Arc::new(
             DebankTraceExt::<_, InMemoryProofsStorage>::new(eth, None, 1)
+                .with_state_root_verification(true)
                 .with_replay_test_probe(probe),
         );
         let request = {
