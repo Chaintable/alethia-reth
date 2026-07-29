@@ -169,7 +169,6 @@ dependencies = [
  "alethia-reth-evm",
  "alethia-reth-primitives",
  "alloy-consensus",
- "alloy-eips 2.0.0",
  "alloy-hardforks",
  "alloy-primitives",
  "alloy-sol-types",

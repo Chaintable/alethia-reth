@@ -8,8 +8,7 @@ use alloy_consensus::{
     BlockBody, EMPTY_OMMER_ROOT_HASH, Header, Signed, TxEip4844, TxLegacy,
     constants::EMPTY_ROOT_HASH, proofs,
 };
-use alloy_eips::eip4895::{Withdrawal, Withdrawals};
-use alloy_hardforks::{EthereumHardfork, ForkCondition};
+use alloy_hardforks::ForkCondition;
 use alloy_primitives::{Address, B256, Bytes, ChainId, FixedBytes, Signature, TxKind, U256};
 use reth_consensus::{Consensus, ConsensusError, FullConsensus, HeaderValidator};
 use reth_ethereum_primitives::{Block, EthPrimitives, Receipt, TransactionSigned};
@@ -142,14 +141,9 @@ fn test_allows_non_blob_transactions() {
 
 #[test]
 fn test_validate_block_pre_execution_rejects_blob_transactions() {
-    let body = BlockBody {
-        transactions: vec![make_blob_tx()],
-        withdrawals: Some(Withdrawals::default()),
-        ..Default::default()
-    };
+    let body = BlockBody { transactions: vec![make_blob_tx()], ..Default::default() };
     let header = Header {
         transactions_root: proofs::calculate_transaction_root(&body.transactions),
-        withdrawals_root: Some(EMPTY_ROOT_HASH),
         ..Default::default()
     };
 
@@ -159,149 +153,6 @@ fn test_validate_block_pre_execution_rejects_blob_transactions() {
         test_consensus(devnet_chain_spec()).validate_block_pre_execution(&block),
         Err(ConsensusError::Other(_))
     ));
-}
-
-#[test]
-fn post_shanghai_header_requires_withdrawals_root() {
-    let consensus = test_consensus(devnet_chain_spec());
-    let header = valid_header_without_withdrawals_root();
-
-    let err = consensus
-        .validate_header(&SealedHeader::new_unhashed(header))
-        .expect_err("post-Shanghai Taiko headers must commit to withdrawals");
-    assert!(matches!(err, ConsensusError::WithdrawalsRootMissing));
-}
-
-#[test]
-fn pre_shanghai_header_rejects_withdrawals_root() {
-    let consensus = test_consensus(pre_shanghai_chain_spec());
-    let header = Header {
-        withdrawals_root: Some(EMPTY_ROOT_HASH),
-        ..valid_header_without_withdrawals_root()
-    };
-
-    let err = consensus
-        .validate_header(&SealedHeader::new_unhashed(header))
-        .expect_err("pre-Shanghai headers must not commit to withdrawals");
-    assert!(matches!(err, ConsensusError::WithdrawalsRootUnexpected));
-}
-
-#[test]
-fn post_shanghai_body_and_header_require_withdrawals() {
-    let consensus = test_consensus(devnet_chain_spec());
-
-    let block = sealed_block_with_withdrawals(None, None);
-    assert!(matches!(
-        <TaikoBeaconConsensus as Consensus<Block>>::validate_body_against_header(
-            &consensus,
-            block.body(),
-            block.sealed_header(),
-        ),
-        Err(ConsensusError::BodyWithdrawalsMissing)
-    ));
-    assert!(matches!(
-        consensus.validate_block_pre_execution(&block),
-        Err(ConsensusError::BodyWithdrawalsMissing)
-    ));
-
-    let block = sealed_block_with_withdrawals(None, Some(EMPTY_ROOT_HASH));
-    assert!(matches!(
-        <TaikoBeaconConsensus as Consensus<Block>>::validate_body_against_header(
-            &consensus,
-            block.body(),
-            block.sealed_header(),
-        ),
-        Err(ConsensusError::BodyWithdrawalsMissing)
-    ));
-    assert!(matches!(
-        consensus.validate_block_pre_execution(&block),
-        Err(ConsensusError::BodyWithdrawalsMissing)
-    ));
-
-    let block = sealed_block_with_withdrawals(Some(Withdrawals::default()), None);
-    assert!(matches!(
-        <TaikoBeaconConsensus as Consensus<Block>>::validate_body_against_header(
-            &consensus,
-            block.body(),
-            block.sealed_header(),
-        ),
-        Err(ConsensusError::WithdrawalsRootMissing)
-    ));
-    assert!(matches!(
-        consensus.validate_block_pre_execution(&block),
-        Err(ConsensusError::WithdrawalsRootMissing)
-    ));
-}
-
-#[test]
-fn pre_shanghai_body_rejects_withdrawals() {
-    let consensus = test_consensus(pre_shanghai_chain_spec());
-    let withdrawals = canonical_withdrawals();
-    let withdrawals_root = proofs::calculate_withdrawals_root(&withdrawals);
-    let block = sealed_block_with_withdrawals(Some(withdrawals), Some(withdrawals_root));
-
-    assert!(matches!(
-        <TaikoBeaconConsensus as Consensus<Block>>::validate_body_against_header(
-            &consensus,
-            block.body(),
-            block.sealed_header(),
-        ),
-        Err(ConsensusError::WithdrawalsRootUnexpected)
-    ));
-    assert!(matches!(
-        consensus.validate_block_pre_execution(&block),
-        Err(ConsensusError::WithdrawalsRootUnexpected)
-    ));
-}
-
-#[test]
-fn post_shanghai_pre_execution_rejects_every_withdrawal_commitment_mutation() {
-    let consensus = test_consensus(devnet_chain_spec());
-    let canonical = canonical_withdrawals();
-    let withdrawals_root = proofs::calculate_withdrawals_root(&canonical);
-
-    let mut amount_zero = canonical.clone();
-    amount_zero[0].amount = 0;
-    let mut index = canonical.clone();
-    index[0].index += 1;
-    let mut validator_index = canonical.clone();
-    validator_index[0].validator_index += 1;
-    let mut order = canonical.clone();
-    order.swap(0, 1);
-
-    for (name, mutated) in [
-        ("amount zero", amount_zero),
-        ("index", index),
-        ("validator index", validator_index),
-        ("order", order),
-    ] {
-        let block = sealed_block_with_withdrawals(Some(mutated), Some(withdrawals_root));
-        let err = consensus
-            .validate_block_pre_execution(&block)
-            .expect_err("a changed withdrawal must change the committed root");
-        assert!(
-            matches!(err, ConsensusError::BodyWithdrawalsRootDiff(_)),
-            "{name}: unexpected error {err:?}"
-        );
-    }
-}
-
-#[test]
-fn post_shanghai_pre_execution_accepts_exact_withdrawals_commitment() {
-    let consensus = test_consensus(devnet_chain_spec());
-    let withdrawals = canonical_withdrawals();
-    let withdrawals_root = proofs::calculate_withdrawals_root(&withdrawals);
-    let block = sealed_block_with_withdrawals(Some(withdrawals), Some(withdrawals_root));
-
-    <TaikoBeaconConsensus as Consensus<Block>>::validate_body_against_header(
-        &consensus,
-        block.body(),
-        block.sealed_header(),
-    )
-    .expect("the exact body/header withdrawals commitment should validate");
-    consensus
-        .validate_block_pre_execution(&block)
-        .expect("the exact withdrawals commitment should pass pre-execution validation");
 }
 
 #[test]
@@ -324,7 +175,6 @@ fn unzen_header_allows_nonzero_difficulty() {
         base_fee_per_gas: Some(1),
         gas_limit: 30_000_000,
         extra_data: shasta_extra_data(),
-        withdrawals_root: Some(EMPTY_ROOT_HASH),
         ..Default::default()
     };
 
@@ -340,7 +190,6 @@ fn shasta_header_requires_exact_extra_data_len() {
         timestamp: 1,
         base_fee_per_gas: Some(1),
         gas_limit: 30_000_000,
-        withdrawals_root: Some(EMPTY_ROOT_HASH),
         ..Default::default()
     };
 
@@ -376,7 +225,6 @@ fn pre_shasta_header_has_no_extra_data_len_rule() {
         timestamp: 1,
         base_fee_per_gas: Some(1),
         gas_limit: 30_000_000,
-        withdrawals_root: Some(EMPTY_ROOT_HASH),
         ..Default::default()
     };
 
@@ -472,44 +320,6 @@ fn make_legacy_tx() -> TransactionSigned {
     Signed::new_unchecked(tx, signature, B256::ZERO).into()
 }
 
-fn canonical_withdrawals() -> Withdrawals {
-    vec![
-        Withdrawal {
-            index: 10,
-            validator_index: 20,
-            address: Address::with_last_byte(1),
-            amount: 7,
-        },
-        Withdrawal {
-            index: 11,
-            validator_index: 21,
-            address: Address::with_last_byte(2),
-            amount: 9,
-        },
-    ]
-    .into()
-}
-
-fn sealed_block_with_withdrawals(
-    withdrawals: Option<Withdrawals>,
-    withdrawals_root: Option<B256>,
-) -> SealedBlock<Block> {
-    SealedBlock::seal_slow(Block {
-        header: Header { timestamp: 1, withdrawals_root, ..Default::default() },
-        body: BlockBody { withdrawals, ..Default::default() },
-    })
-}
-
-fn valid_header_without_withdrawals_root() -> Header {
-    Header {
-        timestamp: 1,
-        base_fee_per_gas: Some(1),
-        gas_limit: 30_000_000,
-        extra_data: shasta_extra_data(),
-        ..Default::default()
-    }
-}
-
 fn test_consensus(chain_spec: TaikoChainSpec) -> TaikoBeaconConsensus {
     TaikoBeaconConsensus::new(Arc::new(chain_spec), Arc::new(NullBlockReader))
 }
@@ -525,12 +335,6 @@ fn devnet_chain_spec() -> TaikoChainSpec {
 fn pre_unzen_chain_spec() -> TaikoChainSpec {
     let mut chain_spec = devnet_chain_spec();
     chain_spec.inner.hardforks.insert(TaikoHardfork::Unzen, ForkCondition::Never);
-    chain_spec
-}
-
-fn pre_shanghai_chain_spec() -> TaikoChainSpec {
-    let mut chain_spec = devnet_chain_spec();
-    chain_spec.inner.hardforks.insert(EthereumHardfork::Shanghai, ForkCondition::Never);
     chain_spec
 }
 

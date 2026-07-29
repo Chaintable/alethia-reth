@@ -12,11 +12,9 @@ use crate::{
 };
 use alethia_reth_block::config::TaikoEvmConfig;
 use alethia_reth_chainspec::hardfork::TaikoHardforks;
-#[cfg(test)]
-use alloy_consensus::constants::EMPTY_WITHDRAWALS;
 use alloy_consensus::{
     BlockHeader, Transaction, TxReceipt,
-    constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS},
+    constants::{EMPTY_OMMER_ROOT_HASH, EMPTY_RECEIPTS, EMPTY_TRANSACTIONS, EMPTY_WITHDRAWALS},
     transaction::TxHashRef,
 };
 use alloy_eips::{BlockId, eip7685::EMPTY_REQUESTS_HASH};
@@ -1074,10 +1072,8 @@ fn validate_stored_consensus(
     let cumulative_gas = receipts.last().map_or(0, TxReceipt::cumulative_gas_used);
     let ommers_are_empty =
         block.body().ommers.is_empty() && block.header().ommers_hash() == EMPTY_OMMER_ROOT_HASH;
-    let withdrawals_match =
-        block.body().calculate_withdrawals_root() == block.header().withdrawals_root();
-    let withdrawals_are_present = !is_unzen_active ||
-        (block.body().withdrawals.is_some() && block.header().withdrawals_root().is_some());
+    let withdrawals_are_empty =
+        block.body().withdrawals.as_ref().is_some_and(|withdrawals| withdrawals.is_empty());
     let fork_fields_are_valid = if is_unzen_active {
         block.header().requests_hash() == Some(EMPTY_REQUESTS_HASH) &&
             block.header().parent_beacon_block_root() == Some(alloy_primitives::B256::ZERO) &&
@@ -1099,8 +1095,8 @@ fn validate_stored_consensus(
         receipt_bloom != block.logs_bloom() ||
         cumulative_gas != block.gas_used() ||
         !ommers_are_empty ||
-        !withdrawals_match ||
-        !withdrawals_are_present ||
+        !withdrawals_are_empty ||
+        block.header().withdrawals_root() != Some(EMPTY_WITHDRAWALS) ||
         !protocol_fields_are_valid
     {
         return Err(rpc_error(
@@ -2432,18 +2428,7 @@ mod tests {
             Some(alloy_consensus::proofs::calculate_withdrawals_root(&withdrawals));
         non_empty_withdrawals.body.withdrawals = Some(withdrawals);
         let non_empty_withdrawals = RecoveredBlock::new_unhashed(non_empty_withdrawals, vec![]);
-        assert!(validate_stored_consensus(&non_empty_withdrawals, &[], true).is_ok());
-
-        let mut wrong_non_empty_withdrawals = non_empty_withdrawals.clone().into_block();
-        wrong_non_empty_withdrawals.body.withdrawals.as_mut().unwrap()[0].amount = 4;
-        assert!(
-            validate_stored_consensus(
-                &RecoveredBlock::new_unhashed(wrong_non_empty_withdrawals, vec![]),
-                &[],
-                true,
-            )
-            .is_err()
-        );
+        assert!(validate_stored_consensus(&non_empty_withdrawals, &[], true).is_err());
 
         let mut missing_withdrawals = unzen.clone().into_block();
         missing_withdrawals.body.withdrawals = None;

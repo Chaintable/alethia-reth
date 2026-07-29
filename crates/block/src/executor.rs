@@ -1,16 +1,14 @@
 //! Taiko block executor integrating anchor pre-execution and tx filtering.
-use std::borrow::Cow;
-
 #[cfg(feature = "prover")]
 use alloy_consensus::transaction::Recovered;
 use alloy_consensus::{Transaction, TransactionEnvelope, TxReceipt};
 use alloy_eips::{Encodable2718, eip7685::Requests};
 use alloy_evm::{
     FromRecoveredTx, FromTxWithEncoded, RecoveredTx,
-    block::{GasOutput, StateChangePostBlockSource, state_changes::balance_increment_state},
+    block::GasOutput,
     eth::{EthTxResult, receipt_builder::ReceiptBuilder},
 };
-use alloy_primitives::{Address, Bytes, Log, U256, Uint, map::AddressMap};
+use alloy_primitives::{Address, Bytes, Log, U256, Uint};
 use reth_evm::{
     Evm, OnStateHook,
     block::{
@@ -21,7 +19,7 @@ use reth_evm::{
 };
 use reth_execution_types::BlockExecutionResult;
 use reth_revm::context::{Block as _, result::ResultAndState};
-use revm_database_interface::{Database, DatabaseCommit, DatabaseCommitExt};
+use revm_database_interface::{Database, DatabaseCommit};
 
 use crate::factory::TaikoBlockExecutionCtx;
 use alethia_reth_chainspec::spec::TaikoExecutorSpec;
@@ -461,33 +459,9 @@ where
 
     /// Applies any necessary changes after executing the block's transactions, completes execution
     /// and returns the underlying EVM along with execution result.
-    fn finish(
-        mut self,
-    ) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
+    fn finish(self) -> Result<(Self::Evm, BlockExecutionResult<R::Receipt>), BlockExecutionError> {
         self.sync_finalized_block_zk_gas();
         self.validate_expected_zk_gas_difficulty()?;
-
-        let mut balance_increments = AddressMap::default();
-        if let Some(withdrawals) = self.ctx.withdrawals.as_deref() {
-            balance_increments.reserve(withdrawals.len());
-            for withdrawal in withdrawals.iter().filter(|withdrawal| withdrawal.amount != 0) {
-                *balance_increments.entry(withdrawal.address).or_default() +=
-                    u128::from(withdrawal.amount);
-            }
-        }
-        self.evm
-            .db_mut()
-            .increment_balances(balance_increments.clone())
-            .map_err(|_| BlockValidationError::IncrementBalanceFailed)?;
-        self.system_caller.try_on_state_with(|| {
-            balance_increment_state(&balance_increments, self.evm.db_mut()).map(|state| {
-                (
-                    StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements),
-                    Cow::Owned(state),
-                )
-            })
-        })?;
-
         Ok((
             self.evm,
             BlockExecutionResult {
@@ -569,10 +543,9 @@ fn decode_post_ontake_extra_data(extradata: Bytes) -> u64 {
 
 #[cfg(test)]
 mod test {
-    use std::sync::{Arc, mpsc};
+    use std::sync::Arc;
 
     use alloy_consensus::{Signed, TxLegacy};
-    use alloy_eips::eip4895::{Withdrawal, Withdrawals};
     use alloy_evm::EvmFactory;
     use alloy_primitives::{Address, B256, Bytes, ChainId, Signature, TxKind, U64, U256};
     use reth_ethereum_primitives::TransactionSigned;
@@ -581,8 +554,8 @@ mod test {
     use reth_primitives_traits::SignedTransaction;
     use reth_revm::{
         State,
-        db::{CacheDB, EmptyDB, states::bundle_state::BundleRetention},
-        state::{AccountInfo, EvmState},
+        db::{CacheDB, EmptyDB},
+        state::AccountInfo,
     };
 
     use alethia_reth_evm::{
@@ -690,93 +663,6 @@ mod test {
         );
     }
 
-    #[test]
-    fn empty_withdrawals_do_not_change_bundle_state() {
-        let chain_spec = Arc::new(unzen_chain_spec());
-        let mut state =
-            State::builder().with_database(EmptyDB::default()).with_bundle_update().build();
-        let evm = TaikoEvmFactory.create_evm(&mut state, unzen_evm_env());
-        let mut ctx = unzen_execution_ctx();
-        ctx.withdrawals = Some(Cow::Owned(Withdrawals::default()));
-        let executor = TaikoBlockExecutor::new(evm, ctx, chain_spec, RethReceiptBuilder::default());
-
-        let (evm, result) = executor.finish().expect("empty withdrawals should be a no-op");
-        assert!(result.requests.is_empty());
-        drop(evm);
-
-        state.merge_transitions(BundleRetention::Reverts);
-        assert!(state.take_bundle().is_empty());
-    }
-
-    #[test]
-    fn non_empty_withdrawals_apply_raw_amount_and_emit_post_block_state() {
-        const INITIAL_BALANCE: u64 = 7;
-        const FIRST_WITHDRAWAL_AMOUNT: u64 = 3;
-        const SECOND_WITHDRAWAL_AMOUNT: u64 = 5;
-
-        let recipient = Address::with_last_byte(0x42);
-        let zero_amount_recipient = Address::with_last_byte(0x43);
-        let mut db = CacheDB::<EmptyDB>::default();
-        db.insert_account_info(
-            recipient,
-            AccountInfo { balance: U256::from(INITIAL_BALANCE), nonce: 1, ..Default::default() },
-        );
-        let mut state = State::builder().with_database(db).with_bundle_update().build();
-        let chain_spec = Arc::new(unzen_chain_spec());
-        let evm = TaikoEvmFactory.create_evm(&mut state, unzen_evm_env());
-        let mut ctx = unzen_execution_ctx();
-        ctx.withdrawals = Some(Cow::Owned(Withdrawals::new(vec![
-            Withdrawal {
-                index: 1,
-                validator_index: 2,
-                address: recipient,
-                amount: FIRST_WITHDRAWAL_AMOUNT,
-            },
-            Withdrawal {
-                index: 2,
-                validator_index: 3,
-                address: recipient,
-                amount: SECOND_WITHDRAWAL_AMOUNT,
-            },
-            Withdrawal { index: 3, validator_index: 4, address: zero_amount_recipient, amount: 0 },
-        ])));
-        let mut executor =
-            TaikoBlockExecutor::new(evm, ctx, chain_spec, RethReceiptBuilder::default());
-        let expected_balance =
-            U256::from(INITIAL_BALANCE + FIRST_WITHDRAWAL_AMOUNT + SECOND_WITHDRAWAL_AMOUNT);
-        let (hook_tx, hook_rx) = mpsc::channel();
-        executor.set_state_hook(Some(Box::new(
-            move |source: StateChangeSource, state: &EvmState| {
-                if matches!(
-                    source,
-                    StateChangeSource::PostBlock(StateChangePostBlockSource::BalanceIncrements)
-                ) {
-                    hook_tx.send(state[&recipient].info.balance).expect("hook receiver is alive");
-                }
-            },
-        )));
-
-        let (evm, result) = executor.finish().expect("withdrawal should be applied");
-        assert!(result.requests.is_empty());
-        assert_eq!(hook_rx.recv().expect("post-block hook should fire"), expected_balance);
-        drop(evm);
-
-        state.merge_transitions(BundleRetention::Reverts);
-        let bundle = state.take_bundle();
-        assert_eq!(
-            bundle
-                .account(&recipient)
-                .and_then(|account| account.account_info())
-                .expect("withdrawal recipient should be in bundle")
-                .balance,
-            expected_balance
-        );
-        assert!(
-            bundle.account(&zero_amount_recipient).is_none(),
-            "zero-amount withdrawal must not create a bundle account"
-        );
-    }
-
     #[cfg(feature = "prover")]
     #[test]
     fn execute_block_stops_after_non_anchor_zk_gas_exhaustion() {
@@ -870,7 +756,6 @@ mod test {
                         gas_limit: 30_000_000,
                         extra_data: Bytes::new(),
                         base_fee_per_gas: 1,
-                        withdrawals: Withdrawals::default(),
                     },
                 )
                 .expect("next block env should build");

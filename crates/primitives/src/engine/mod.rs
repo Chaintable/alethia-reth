@@ -36,14 +36,11 @@ impl PayloadTypes for TaikoEngineTypes {
         let tx_hash = block.transactions_root;
         let withdrawals_hash = block.withdrawals_root;
         let header_difficulty = block.header().difficulty;
-        let withdrawals =
-            block.body().withdrawals.clone().map(|withdrawals| withdrawals.into_inner());
 
         let payload = ExecutionPayloadV1::from_block_unchecked(block.hash(), &block.into_block());
 
         TaikoExecutionData {
             execution_payload: payload.into(),
-            withdrawals,
             taiko_sidecar: TaikoExecutionDataSidecar {
                 tx_hash,
                 withdrawals_hash,
@@ -67,41 +64,4 @@ impl EngineTypes for TaikoEngineTypes {
     type ExecutionPayloadEnvelopeV5 = ExecutionPayloadEnvelopeV5;
     /// Execution Payload V6 envelope type.
     type ExecutionPayloadEnvelopeV6 = ExecutionPayloadEnvelopeV6;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use alloy_consensus::Header;
-    use alloy_primitives::Address;
-    use alloy_rpc_types_engine::ExecutionPayload;
-    use alloy_rpc_types_eth::Withdrawal;
-    use reth_ethereum_primitives::{Block, BlockBody};
-
-    #[test]
-    fn block_to_payload_preserves_full_withdrawals() {
-        let withdrawals = vec![Withdrawal {
-            index: 1,
-            validator_index: 2,
-            address: Address::with_last_byte(0x42),
-            amount: 3,
-        }];
-        let body =
-            BlockBody { withdrawals: Some(withdrawals.clone().into()), ..Default::default() };
-        let block = SealedBlock::seal_slow(Block {
-            header: Header {
-                withdrawals_root: body.calculate_withdrawals_root(),
-                ..Default::default()
-            },
-            body,
-        });
-
-        let payload = <TaikoEngineTypes as PayloadTypes>::block_to_payload(block);
-
-        assert_eq!(payload.withdrawals.as_ref(), Some(&withdrawals));
-        match payload.into_payload() {
-            ExecutionPayload::V2(payload) => assert_eq!(payload.withdrawals, withdrawals),
-            payload => panic!("block withdrawals must select V2, got {payload:?}"),
-        }
-    }
 }

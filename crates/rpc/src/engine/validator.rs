@@ -6,7 +6,7 @@ use alethia_reth_primitives::{
     payload::attributes::TaikoPayloadAttributes,
     transaction::is_allowed_tx_type,
 };
-use alloy_consensus::{BlockHeader, proofs};
+use alloy_consensus::{BlockHeader, EMPTY_ROOT_HASH};
 use alloy_eips::eip7685::EMPTY_REQUESTS_HASH;
 use alloy_primitives::B256;
 use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadError};
@@ -25,7 +25,7 @@ use reth_node_builder::{
 };
 use reth_payload_primitives::{
     EngineApiMessageVersion, EngineObjectValidationError, InvalidPayloadAttributesError,
-    MessageValidationKind, PayloadAttributes, PayloadOrAttributes, validate_withdrawals_presence,
+    PayloadAttributes, PayloadOrAttributes,
 };
 use reth_primitives_traits::{Block as BlockTrait, SealedBlock};
 use std::sync::Arc;
@@ -39,12 +39,6 @@ enum TaikoPayloadValidationError {
     /// Unzen payloads must carry the original header difficulty through the Taiko sidecar.
     #[error("missing header difficulty for Unzen payload")]
     MissingUnzenHeaderDifficulty,
-    /// Complete Taiko payloads must carry the Shanghai withdrawals list, including when empty.
-    #[error("missing withdrawals for complete Taiko payload")]
-    MissingWithdrawals,
-    /// Legacy hash-only payloads must carry the committed withdrawals root in the sidecar.
-    #[error("missing withdrawals hash for legacy Taiko payload")]
-    MissingLegacyWithdrawalsHash,
 }
 
 /// Builder for [`TaikoEngineValidator`].
@@ -131,20 +125,15 @@ where
         &self,
         payload: Types::ExecutionData,
     ) -> Result<SealedBlock<Self::Block>, NewPayloadError> {
-        let TaikoExecutionData { execution_payload, withdrawals, taiko_sidecar } = payload;
+        let TaikoExecutionData { execution_payload, taiko_sidecar } = payload;
 
         let expected_hash = execution_payload.block_hash;
         let is_unzen_active = self.chain_spec.is_unzen_active(execution_payload.timestamp);
-        let transactions_present = execution_payload.transactions.is_some();
-        let legacy_hash_only = !transactions_present && withdrawals.is_none();
 
         if is_unzen_active && taiko_sidecar.header_difficulty.is_none() {
             return Err(NewPayloadError::other(
                 TaikoPayloadValidationError::MissingUnzenHeaderDifficulty,
             ));
-        }
-        if transactions_present && withdrawals.is_none() {
-            return Err(NewPayloadError::other(TaikoPayloadValidationError::MissingWithdrawals));
         }
 
         // First parse the block.
@@ -156,20 +145,16 @@ where
         block.header.blob_gas_used = is_unzen_active.then_some(0);
         block.header.excess_blob_gas = is_unzen_active.then_some(0);
         block.header.requests_hash = is_unzen_active.then_some(EMPTY_REQUESTS_HASH);
-        if legacy_hash_only {
+        if !taiko_sidecar.tx_hash.is_zero() {
             block.header.transactions_root = taiko_sidecar.tx_hash;
-            let withdrawals_hash =
-                taiko_sidecar.withdrawals_hash.filter(|hash| !hash.is_zero()).ok_or_else(|| {
-                    NewPayloadError::other(
-                        TaikoPayloadValidationError::MissingLegacyWithdrawalsHash,
-                    )
-                })?;
-            block.header.withdrawals_root = Some(withdrawals_hash);
-            block.body.withdrawals = None;
-        } else if let Some(withdrawals) = withdrawals {
-            let withdrawals = Withdrawals::new(withdrawals);
-            block.header.withdrawals_root = Some(proofs::calculate_withdrawals_root(&withdrawals));
-            block.body.withdrawals = Some(withdrawals);
+        }
+        if let Some(withdrawals_hash) = taiko_sidecar.withdrawals_hash {
+            if !withdrawals_hash.is_zero() {
+                block.header.withdrawals_root = taiko_sidecar.withdrawals_hash;
+            } else {
+                block.header.withdrawals_root = Some(EMPTY_ROOT_HASH);
+            }
+            block.body.withdrawals = Some(Withdrawals::default());
         }
         let sealed_block = block.seal_slow();
 
@@ -230,46 +215,21 @@ where
     /// and the message version.
     fn validate_version_specific_fields(
         &self,
-        version: EngineApiMessageVersion,
-        payload_or_attrs: PayloadOrAttributes<'_, Types::ExecutionData, Types::PayloadAttributes>,
+        _version: EngineApiMessageVersion,
+        _payload_or_attrs: PayloadOrAttributes<'_, Types::ExecutionData, Types::PayloadAttributes>,
     ) -> Result<(), EngineObjectValidationError> {
-        let is_legacy_hash_only = version == EngineApiMessageVersion::V2 &&
-            matches!(
-                &payload_or_attrs,
-                PayloadOrAttributes::ExecutionPayload(payload)
-                    if payload.execution_payload.transactions.is_none() &&
-                        payload.withdrawals.is_none() &&
-                        payload
-                            .taiko_sidecar
-                            .withdrawals_hash
-                            .is_some_and(|hash| !hash.is_zero())
-            );
-        if is_legacy_hash_only {
-            return Ok(())
-        }
-
-        validate_withdrawals_presence(
-            self.chain_spec.as_ref(),
-            version,
-            payload_or_attrs.message_validation_kind(),
-            payload_or_attrs.timestamp(),
-            payload_or_attrs.withdrawals().is_some(),
-        )
+        // For Taiko, we don't have version-specific validation
+        Ok(())
     }
 
     /// Ensures that the payload attributes are valid for the given [`EngineApiMessageVersion`].
     fn ensure_well_formed_attributes(
         &self,
-        version: EngineApiMessageVersion,
-        attributes: &Types::PayloadAttributes,
+        _version: EngineApiMessageVersion,
+        _attributes: &Types::PayloadAttributes,
     ) -> Result<(), EngineObjectValidationError> {
-        validate_withdrawals_presence(
-            self.chain_spec.as_ref(),
-            version,
-            MessageValidationKind::PayloadAttributes,
-            attributes.timestamp(),
-            attributes.withdrawals().is_some(),
-        )
+        // Attributes are well-formed if they pass the basic validation
+        Ok(())
     }
 }
 
@@ -277,19 +237,16 @@ where
 mod tests {
     use super::*;
     use alethia_reth_chainspec::{TAIKO_DEVNET, hardfork::TaikoHardfork};
-    use alethia_reth_primitives::{
-        engine::{
-            TaikoEngineTypes,
-            types::{TaikoExecutionData, TaikoExecutionDataSidecar},
-        },
-        payload::attributes::{RpcL1Origin, TaikoBlockMetadata, TaikoPayloadAttributes},
+    use alethia_reth_primitives::engine::{
+        TaikoEngineTypes,
+        types::{TaikoExecutionData, TaikoExecutionDataSidecar},
     };
     use alloy_consensus::{BlockBody, Header, constants::EMPTY_WITHDRAWALS};
     use alloy_eips::merge::BEACON_NONCE;
     use alloy_hardforks::ForkCondition;
     use alloy_primitives::{Address, B256, Bytes, U256};
-    use alloy_rpc_types_engine::{ExecutionPayloadV1, PayloadAttributes as EthPayloadAttributes};
-    use alloy_rpc_types_eth::{Withdrawal, Withdrawals};
+    use alloy_rpc_types_engine::ExecutionPayloadV1;
+    use alloy_rpc_types_eth::Withdrawals;
     use reth_primitives_traits::BlockBody as _;
 
     #[test]
@@ -357,197 +314,6 @@ mod tests {
         assert_eq!(sealed.header().requests_hash, Some(EMPTY_REQUESTS_HASH));
     }
 
-    #[test]
-    fn complete_payload_uses_full_withdrawals_and_ignores_sidecar_hash() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let withdrawals = sample_state_neutral_withdrawals();
-        let payload = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            Some(withdrawals.clone()),
-            Some(B256::repeat_byte(0xaa)),
-            true,
-        );
-
-        let sealed =
-            <TaikoEngineValidator as PayloadValidator<TaikoEngineTypes>>::convert_payload_to_block(
-                &validator,
-                payload.clone(),
-            )
-            .expect("full withdrawals must take precedence over the sidecar hash");
-
-        assert_eq!(sealed.hash(), payload.execution_payload.block_hash);
-        assert_eq!(
-            sealed.header().withdrawals_root,
-            Some(proofs::calculate_withdrawals_root(&withdrawals))
-        );
-        assert_eq!(sealed.body().withdrawals.as_ref(), Some(&withdrawals));
-    }
-
-    #[test]
-    fn complete_payload_rejects_missing_withdrawals() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let payload = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            None,
-            Some(EMPTY_WITHDRAWALS),
-            true,
-        );
-
-        let err =
-            <TaikoEngineValidator as PayloadValidator<TaikoEngineTypes>>::convert_payload_to_block(
-                &validator, payload,
-            )
-            .expect_err("complete transaction payloads must include withdrawals");
-
-        assert_eq!(err.to_string(), "missing withdrawals for complete Taiko payload");
-    }
-
-    #[test]
-    fn legacy_hash_only_payload_preserves_committed_roots_without_fake_body() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let payload = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            None,
-            Some(EMPTY_WITHDRAWALS),
-            false,
-        );
-
-        let sealed =
-            <TaikoEngineValidator as PayloadValidator<TaikoEngineTypes>>::convert_payload_to_block(
-                &validator,
-                payload.clone(),
-            )
-            .expect("legacy payload should restore roots from the Taiko sidecar");
-
-        assert_eq!(sealed.hash(), payload.execution_payload.block_hash);
-        assert_eq!(sealed.header().withdrawals_root, Some(EMPTY_WITHDRAWALS));
-        assert!(sealed.body().withdrawals.is_none());
-        assert!(payload.execution_payload.transactions.is_none());
-    }
-
-    #[test]
-    fn legacy_hash_only_payload_rejects_missing_withdrawals_hash() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let payload = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            None,
-            None,
-            false,
-        );
-
-        let err =
-            <TaikoEngineValidator as PayloadValidator<TaikoEngineTypes>>::convert_payload_to_block(
-                &validator, payload,
-            )
-            .expect_err("legacy payload must include a nonzero withdrawals hash");
-
-        assert_eq!(err.to_string(), "missing withdrawals hash for legacy Taiko payload");
-    }
-
-    #[test]
-    fn state_neutral_withdrawals_metadata_mutations_change_block_hash() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let original = sample_state_neutral_withdrawals();
-        let payload = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            Some(original.clone()),
-            Some(EMPTY_WITHDRAWALS),
-            true,
-        );
-        let mut mutations = Vec::new();
-
-        let mut changed_index = original.clone().into_inner();
-        changed_index[0].index += 1;
-        mutations.push(changed_index);
-
-        let mut changed_validator = original.clone().into_inner();
-        changed_validator[0].validator_index += 1;
-        mutations.push(changed_validator);
-
-        let mut changed_order = original.into_inner();
-        changed_order.swap(0, 1);
-        mutations.push(changed_order);
-
-        for mutated in mutations {
-            let mut candidate = payload.clone();
-            candidate.withdrawals = Some(mutated);
-            let err = <TaikoEngineValidator as PayloadValidator<TaikoEngineTypes>>::convert_payload_to_block(
-                &validator,
-                candidate,
-            )
-            .expect_err("withdrawals metadata mutations must invalidate the committed block hash");
-            assert!(err.to_string().contains("block hash"), "unexpected error: {err}");
-        }
-    }
-
-    #[test]
-    fn engine_v2_allows_only_the_legacy_hash_only_withdrawals_exception() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let legacy = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            None,
-            Some(EMPTY_WITHDRAWALS),
-            false,
-        );
-        <TaikoEngineValidator as EngineApiValidator<TaikoEngineTypes>>::validate_version_specific_fields(
-            &validator,
-            EngineApiMessageVersion::V2,
-            PayloadOrAttributes::ExecutionPayload(&legacy),
-        )
-        .expect("V2 must preserve Taiko-Geth's legacy hash-only exception");
-
-        let complete_missing_withdrawals = sample_unzen_execution_data_with_withdrawals(
-            U256::from(7_u64),
-            Some(U256::from(7_u64)),
-            Some(B256::ZERO),
-            None,
-            Some(EMPTY_WITHDRAWALS),
-            true,
-        );
-        let err = <TaikoEngineValidator as EngineApiValidator<TaikoEngineTypes>>::validate_version_specific_fields(
-            &validator,
-            EngineApiMessageVersion::V2,
-            PayloadOrAttributes::ExecutionPayload(&complete_missing_withdrawals),
-        )
-        .expect_err("complete V2 payloads must not use the hash-only exception");
-
-        assert!(err.to_string().contains("no withdrawals post-Shanghai"));
-    }
-
-    #[test]
-    fn forkchoice_v2_rejects_missing_withdrawals_and_accepts_empty_list() {
-        let validator = TaikoEngineValidator::new(Arc::new(unzen_chain_spec()));
-        let missing = sample_payload_attributes(None);
-        let err =
-            <TaikoEngineValidator as EngineApiValidator<TaikoEngineTypes>>::ensure_well_formed_attributes(
-                &validator,
-                EngineApiMessageVersion::V2,
-                &missing,
-            )
-            .expect_err("post-Shanghai payload attributes must include withdrawals");
-        assert!(err.to_string().contains("no withdrawals post-Shanghai"));
-
-        let empty = sample_payload_attributes(Some(Vec::new()));
-        <TaikoEngineValidator as EngineApiValidator<TaikoEngineTypes>>::ensure_well_formed_attributes(
-            &validator,
-            EngineApiMessageVersion::V2,
-            &empty,
-        )
-        .expect("an explicit empty withdrawals list is valid");
-    }
-
     fn unzen_chain_spec() -> TaikoChainSpec {
         let mut chain_spec = (*TAIKO_DEVNET).as_ref().clone();
         chain_spec.inner.hardforks.insert(TaikoHardfork::Unzen, ForkCondition::Timestamp(0));
@@ -559,77 +325,6 @@ mod tests {
         header_difficulty: Option<U256>,
         parent_beacon_block_root: Option<B256>,
     ) -> TaikoExecutionData {
-        sample_unzen_execution_data_with_withdrawals(
-            difficulty,
-            header_difficulty,
-            parent_beacon_block_root,
-            Some(Withdrawals::default()),
-            Some(EMPTY_WITHDRAWALS),
-            true,
-        )
-    }
-
-    fn sample_state_neutral_withdrawals() -> Withdrawals {
-        Withdrawals::new(vec![
-            Withdrawal {
-                index: 1,
-                validator_index: 2,
-                address: Address::with_last_byte(0x61),
-                amount: 0,
-            },
-            Withdrawal {
-                index: 3,
-                validator_index: 4,
-                address: Address::with_last_byte(0x62),
-                amount: 0,
-            },
-        ])
-    }
-
-    fn sample_payload_attributes(withdrawals: Option<Vec<Withdrawal>>) -> TaikoPayloadAttributes {
-        TaikoPayloadAttributes {
-            payload_attributes: EthPayloadAttributes {
-                timestamp: 1,
-                prev_randao: B256::ZERO,
-                suggested_fee_recipient: Address::ZERO,
-                withdrawals,
-                parent_beacon_block_root: Some(B256::ZERO),
-                slot_number: None,
-            },
-            base_fee_per_gas: U256::from(1_u64),
-            block_metadata: TaikoBlockMetadata {
-                beneficiary: Address::ZERO,
-                gas_limit: 30_000_000,
-                timestamp: U256::from(1_u64),
-                mix_hash: B256::ZERO,
-                tx_list: Some(Bytes::new()),
-                extra_data: Bytes::new(),
-            },
-            l1_origin: RpcL1Origin {
-                block_id: U256::ZERO,
-                l2_block_hash: B256::ZERO,
-                l1_block_height: None,
-                l1_block_hash: None,
-                build_payload_args_id: [0; 8],
-                is_forced_inclusion: false,
-                signature: [0; 65],
-            },
-            anchor_transaction: None,
-        }
-    }
-
-    fn sample_unzen_execution_data_with_withdrawals(
-        difficulty: U256,
-        header_difficulty: Option<U256>,
-        parent_beacon_block_root: Option<B256>,
-        withdrawals: Option<Withdrawals>,
-        withdrawals_hash: Option<B256>,
-        transactions_present: bool,
-    ) -> TaikoExecutionData {
-        let withdrawals_root = withdrawals
-            .as_ref()
-            .map(|withdrawals| proofs::calculate_withdrawals_root(withdrawals))
-            .or(withdrawals_hash);
         let block = reth_ethereum::Block {
             header: Header {
                 parent_hash: B256::with_last_byte(0x11),
@@ -640,7 +335,7 @@ mod tests {
                 >::new(
                 )),
                 receipts_root: B256::with_last_byte(0x44),
-                withdrawals_root,
+                withdrawals_root: Some(EMPTY_WITHDRAWALS),
                 logs_bloom: Default::default(),
                 number: 1,
                 gas_limit: 30_000_000,
@@ -660,31 +355,17 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 ommers: vec![],
-                withdrawals: withdrawals.clone(),
+                withdrawals: Some(Withdrawals::default()),
             },
         };
         let block_hash = block.header.hash_slow();
         let execution_payload = ExecutionPayloadV1::from_block_unchecked(block_hash, &block);
-        let withdrawals = withdrawals.map(Withdrawals::into_inner);
-        let execution_payload =
-            alethia_reth_primitives::engine::types::TaikoExecutionPayloadV1::from(
-                execution_payload,
-            );
-        let execution_payload = if transactions_present {
-            execution_payload
-        } else {
-            alethia_reth_primitives::engine::types::TaikoExecutionPayloadV1 {
-                transactions: None,
-                ..execution_payload
-            }
-        };
 
         TaikoExecutionData {
-            execution_payload,
-            withdrawals,
+            execution_payload: execution_payload.into(),
             taiko_sidecar: TaikoExecutionDataSidecar {
                 tx_hash: block.body.calculate_tx_root(),
-                withdrawals_hash,
+                withdrawals_hash: Some(EMPTY_WITHDRAWALS),
                 header_difficulty,
                 taiko_block: Some(true),
             },

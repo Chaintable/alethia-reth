@@ -60,22 +60,6 @@ impl std::fmt::Display for MissingBaseFee {
 
 impl std::error::Error for MissingBaseFee {}
 
-/// Error returned when a Taiko block omits its post-Shanghai withdrawals body.
-#[derive(Debug)]
-pub struct MissingWithdrawals {
-    /// Block number whose body omitted withdrawals.
-    pub block_number: u64,
-}
-
-impl std::fmt::Display for MissingWithdrawals {
-    /// Formats the missing-withdrawals error with the affected block number.
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "missing withdrawals for Taiko block {}", self.block_number)
-    }
-}
-
-impl std::error::Error for MissingWithdrawals {}
-
 /// Error when an Unzen payload sidecar is missing the hash-relevant header difficulty.
 #[derive(Debug)]
 pub struct MissingUnzenHeaderDifficulty {
@@ -260,7 +244,7 @@ impl ConfigureEvm for TaikoEvmConfig {
             parent_hash: block.header().parent_hash,
             parent_beacon_block_root: block.header().parent_beacon_block_root,
             ommers: &[],
-            withdrawals: block.body().withdrawals.as_ref().map(Cow::Borrowed),
+            withdrawals: Some(Cow::Owned(Withdrawals::new(vec![]))),
             basefee_per_gas,
             extra_data: block.header().extra_data.clone(),
             is_unzen_active,
@@ -281,7 +265,7 @@ impl ConfigureEvm for TaikoEvmConfig {
             parent_hash: parent.hash(),
             parent_beacon_block_root: normalize_parent_beacon_block_root(is_unzen_active, None),
             ommers: &[],
-            withdrawals: Some(Cow::Owned(ctx.withdrawals)),
+            withdrawals: Some(Cow::Owned(Withdrawals::new(vec![]))),
             basefee_per_gas: ctx.base_fee_per_gas,
             extra_data: ctx.extra_data,
             is_unzen_active,
@@ -398,8 +382,6 @@ pub struct TaikoNextBlockEnvAttributes {
     pub extra_data: Bytes,
     /// The base fee per gas for the next block.
     pub base_fee_per_gas: u64,
-    /// Withdrawals to apply and commit into the next block body.
-    pub withdrawals: Withdrawals,
 }
 
 /// Map the latest active hardfork at the given header to a [`TaikoSpecId`].
@@ -450,7 +432,6 @@ impl BuildPendingEnv<Header> for TaikoNextBlockEnvAttributes {
             gas_limit: parent.gas_limit,
             extra_data: parent.extra_data.clone(),
             base_fee_per_gas: parent.base_fee_per_gas.unwrap_or_default(),
-            withdrawals: Withdrawals::default(),
         }
     }
 }
@@ -459,9 +440,7 @@ impl BuildPendingEnv<Header> for TaikoNextBlockEnvAttributes {
 mod tests {
     use super::*;
     use alethia_reth_chainspec::{TAIKO_DEVNET, hardfork::TaikoHardfork};
-    use alloy_eips::eip4895::Withdrawal;
     use alloy_hardforks::ForkCondition;
-    use reth_ethereum_primitives::{Block, BlockBody};
     use std::sync::Arc;
 
     #[test]
@@ -502,56 +481,6 @@ mod tests {
 
         assert_eq!(blob_env.excess_blob_gas, 0);
         assert_eq!(blob_env.blob_gasprice, 1);
-    }
-
-    #[test]
-    fn block_context_preserves_imported_withdrawals() {
-        let withdrawal = Withdrawal {
-            index: 1,
-            validator_index: 2,
-            address: Address::with_last_byte(0x42),
-            amount: 3,
-        };
-        let withdrawals = Withdrawals::new(vec![withdrawal]);
-        let block = SealedBlock::new_unhashed(Block {
-            header: Header { base_fee_per_gas: Some(1), ..Header::default() },
-            body: BlockBody {
-                transactions: vec![],
-                ommers: vec![],
-                withdrawals: Some(withdrawals.clone()),
-            },
-        });
-        let config = TaikoEvmConfig::new(TAIKO_DEVNET.clone());
-
-        let ctx = config.context_for_block(&block).expect("block context should build");
-
-        assert_eq!(ctx.withdrawals.as_deref(), Some(&withdrawals));
-    }
-
-    #[test]
-    fn next_block_context_preserves_builder_withdrawals() {
-        let withdrawals = Withdrawals::new(vec![Withdrawal {
-            index: 1,
-            validator_index: 2,
-            address: Address::with_last_byte(0x42),
-            amount: 3,
-        }]);
-        let config = TaikoEvmConfig::new(TAIKO_DEVNET.clone());
-        let parent = SealedHeader::seal_slow(Header::default());
-        let attributes = TaikoNextBlockEnvAttributes {
-            timestamp: 1,
-            suggested_fee_recipient: Address::ZERO,
-            prev_randao: B256::ZERO,
-            gas_limit: 30_000_000,
-            extra_data: Bytes::new(),
-            base_fee_per_gas: 1,
-            withdrawals: withdrawals.clone(),
-        };
-
-        let ctx =
-            config.context_for_next_block(&parent, attributes).expect("next context should build");
-
-        assert_eq!(ctx.withdrawals.as_deref(), Some(&withdrawals));
     }
 
     #[test]
@@ -596,7 +525,6 @@ mod tests {
                     block_hash: B256::ZERO,
                     transactions: Some(vec![]),
                 },
-                withdrawals: Some(Vec::new()),
                 taiko_sidecar: TaikoExecutionDataSidecar {
                     tx_hash: B256::ZERO,
                     withdrawals_hash: None,

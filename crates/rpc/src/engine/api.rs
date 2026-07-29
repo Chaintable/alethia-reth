@@ -314,12 +314,10 @@ mod tests {
     use super::*;
 
     use alethia_reth_chainspec::{TAIKO_DEVNET, hardfork::TaikoHardfork};
-    use alloy_consensus::{BlockBody, Header, proofs};
+    use alloy_consensus::{BlockBody, Header, constants::EMPTY_WITHDRAWALS};
     use alloy_eips::merge::BEACON_NONCE;
     use alloy_hardforks::ForkCondition;
     use alloy_primitives::{Address, B256, Bytes, U256};
-    use alloy_rpc_types_engine::ExecutionPayloadFieldV2;
-    use alloy_rpc_types_eth::{Withdrawal, Withdrawals};
     use reth_primitives_traits::Block as _;
     use std::sync::Arc;
 
@@ -362,43 +360,6 @@ mod tests {
         assert_eq!(envelope.block_value, U256::from(1_u64));
     }
 
-    #[test]
-    fn get_payload_v2_preserves_non_empty_withdrawals_order() {
-        let chain_spec = unzen_chain_spec();
-        let withdrawals = Withdrawals::new(vec![
-            Withdrawal {
-                index: 1,
-                validator_index: 2,
-                address: Address::with_last_byte(0x61),
-                amount: 3,
-            },
-            Withdrawal {
-                index: 4,
-                validator_index: 5,
-                address: Address::with_last_byte(0x62),
-                amount: 6,
-            },
-        ]);
-        let built_payload = sample_built_payload_with_withdrawals(
-            U256::from(7_u64),
-            U256::from(1_u64),
-            1,
-            withdrawals.clone(),
-        );
-        let block_hash = built_payload.block().hash();
-
-        let envelope = convert_built_payload_to_execution_payload_envelope_v2(
-            chain_spec.as_ref(),
-            built_payload,
-        );
-        let ExecutionPayloadFieldV2::V2(payload) = envelope.execution_payload else {
-            panic!("post-Shanghai Taiko payload must use the V2 response shape")
-        };
-
-        assert_eq!(payload.withdrawals, withdrawals.into_inner());
-        assert_eq!(payload.payload_inner.block_hash, block_hash);
-    }
-
     fn unzen_chain_spec() -> Arc<alethia_reth_chainspec::spec::TaikoChainSpec> {
         let mut chain_spec = (*TAIKO_DEVNET).as_ref().clone();
         chain_spec.inner.hardforks.insert(TaikoHardfork::Unzen, ForkCondition::Timestamp(0));
@@ -412,27 +373,13 @@ mod tests {
     }
 
     fn sample_built_payload(difficulty: U256, fees: U256, timestamp: u64) -> EthBuiltPayload {
-        sample_built_payload_with_withdrawals(difficulty, fees, timestamp, Withdrawals::default())
-    }
-
-    fn sample_built_payload_with_withdrawals(
-        difficulty: U256,
-        fees: U256,
-        timestamp: u64,
-        withdrawals: Withdrawals,
-    ) -> EthBuiltPayload {
-        let block = sample_unzen_block(difficulty, timestamp, withdrawals);
+        let block = sample_unzen_block(difficulty, timestamp);
         let sealed_block = Arc::new(block.seal_slow());
 
         EthBuiltPayload::new(sealed_block, fees, None, None)
     }
 
-    fn sample_unzen_block(
-        difficulty: U256,
-        timestamp: u64,
-        withdrawals: Withdrawals,
-    ) -> reth_ethereum::Block {
-        let withdrawals_root = proofs::calculate_withdrawals_root(&withdrawals);
+    fn sample_unzen_block(difficulty: U256, timestamp: u64) -> reth_ethereum::Block {
         reth_ethereum::Block {
             header: Header {
                 parent_hash: B256::with_last_byte(0x11),
@@ -443,7 +390,7 @@ mod tests {
                 >::new(
                 )),
                 receipts_root: B256::with_last_byte(0x44),
-                withdrawals_root: Some(withdrawals_root),
+                withdrawals_root: Some(EMPTY_WITHDRAWALS),
                 logs_bloom: Default::default(),
                 number: 1,
                 gas_limit: 30_000_000,
@@ -461,7 +408,7 @@ mod tests {
             body: BlockBody {
                 transactions: vec![],
                 ommers: vec![],
-                withdrawals: Some(withdrawals),
+                withdrawals: Some(Default::default()),
             },
         }
     }

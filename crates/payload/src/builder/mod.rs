@@ -206,7 +206,6 @@ where
                 gas_limit: attributes.gas_limit,
                 extra_data: attributes.extra_data.clone(),
                 base_fee_per_gas: attributes.base_fee_per_gas,
-                withdrawals: attributes.withdrawals.clone(),
             },
         )
         .map_err(PayloadBuilderError::other)?;

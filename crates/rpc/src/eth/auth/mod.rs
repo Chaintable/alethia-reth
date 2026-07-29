@@ -6,7 +6,6 @@ use alloy_consensus::BlockHeader as _;
 use alloy_eips::{BlockId, BlockNumberOrTag};
 use alloy_json_rpc::RpcObject;
 use alloy_primitives::{Bytes, U256};
-use alloy_rpc_types_eth::Withdrawals;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth::{
@@ -347,7 +346,6 @@ where
                     gas_limit: combined_gas_limit,
                     extra_data: parent.extra_data().clone(),
                     base_fee_per_gas: base_fee,
-                    withdrawals: Withdrawals::default(),
                 },
             )
             .map_err(|_| {
