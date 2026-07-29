@@ -381,7 +381,8 @@ pub fn format_error(result: InstructionResult, output: &[u8]) -> Result<Option<S
             .unwrap_or_else(|| "execution reverted".into()),
         InstructionResult::OutOfGas |
         InstructionResult::PrecompileOOG |
-        InstructionResult::MemoryOOG => "out of gas".into(),
+        InstructionResult::MemoryOOG |
+        InstructionResult::MemoryLimitOOG => "out of gas".into(),
         InstructionResult::ReentrancySentryOOG => {
             "out of gas: not enough gas for reentrancy sentry".into()
         }
@@ -1360,6 +1361,7 @@ mod tests {
             (InstructionResult::CallTooDeep, "max call depth exceeded"),
             (InstructionResult::OutOfFunds, "insufficient balance for transfer"),
             (InstructionResult::InvalidOperandOOG, "gas uint64 overflow"),
+            (InstructionResult::MemoryLimitOOG, "out of gas"),
             (
                 InstructionResult::ReentrancySentryOOG,
                 "out of gas: not enough gas for reentrancy sentry",
@@ -1499,6 +1501,15 @@ mod tests {
         let (_, error_traces, _, _) =
             build_debank_traces(B256::ZERO, arena, &exact_errors, &mut 0).unwrap();
         assert_eq!(error_traces[0].error, "stack underflow (0 <=> 2)");
+
+        let mut precompile_error = node(0, None, vec![], false);
+        precompile_error.trace.status = Some(InstructionResult::PrecompileError);
+        let mut arena = CallTraceArena::default();
+        *arena.nodes_mut() = vec![precompile_error];
+        let exact_errors = vec![Some("invalid input length".into())];
+        let (_, error_traces, _, _) =
+            build_debank_traces(B256::ZERO, arena, &exact_errors, &mut 0).unwrap();
+        assert_eq!(error_traces[0].error, "invalid input length");
 
         let mut missing_context = node(0, None, vec![], false);
         missing_context.trace.status = Some(InstructionResult::OpcodeNotFound);

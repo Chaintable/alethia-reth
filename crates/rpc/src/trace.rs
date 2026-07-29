@@ -7,7 +7,7 @@ use crate::{
         decode_and_validate_storage_diff_exact, genesis_storage_contracts,
         observed_storage_contracts,
     },
-    geth_error::GethErrorInspector,
+    geth_error::{GethErrorInspector, PrecompileErrorCapture},
     proof_state::ProofHistoryStateProviderFactory,
 };
 use alethia_reth_block::config::TaikoEvmConfig;
@@ -777,12 +777,13 @@ where
                                 error,
                             )
                         })?;
+                    let precompile_errors = PrecompileErrorCapture::default();
                     let evm = evm_config.evm_with_env_and_inspector(
                         &mut state,
                         evm_env,
                         (
                             TracingInspector::new(debank_tracing_config()),
-                            GethErrorInspector::default(),
+                            GethErrorInspector::with_precompile_errors(precompile_errors.clone()),
                         ),
                     );
                     let mut executor = evm_config.create_executor(evm, ctx);
@@ -795,6 +796,7 @@ where
                             error,
                         )
                     })?;
+                    precompile_errors.install(executor.evm_mut().precompiles_mut());
                     executor.evm_mut().set_inspector_enabled(true);
                     #[cfg(test)]
                     if let Some(probe) = replay_test_probe.as_ref() {
@@ -1407,6 +1409,106 @@ mod tests {
         };
         cache_new_blocks_task(cache.clone(), stream::iter([notification])).await;
         cache
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn typed_precompile_error_is_emitted_as_a_frame_error() {
+        let chain_spec = TAIKO_MAINNET.clone();
+        let sender = Address::repeat_byte(0x11);
+        let contract = Address::repeat_byte(0x22);
+        let precompile = Address::with_last_byte(0x09);
+        let code = Bytes::from_static(&[
+            0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x00, 0x60, 0x09, 0x61, 0xff,
+            0xff, 0xf1, 0x50, 0x00,
+        ]);
+        let transaction: reth_ethereum_primitives::TransactionSigned = Signed::new_unchecked(
+            TxLegacy {
+                chain_id: Some(ChainId::from(167_000_u64)),
+                nonce: 0,
+                gas_price: 1,
+                gas_limit: 100_000,
+                to: TxKind::Call(contract),
+                value: U256::ZERO,
+                input: Bytes::new(),
+            },
+            Signature::new(U256::from(1), U256::from(2), false),
+            B256::repeat_byte(0x33),
+        )
+        .into();
+        // The outer transaction succeeds after swallowing the failed Blake2F call. Pinning the
+        // historical gas use also guards that this fixture keeps executing under the intended
+        // Taiko rules.
+        let gas_used = 86_658;
+        let receipt = reth_ethereum_primitives::Receipt {
+            tx_type: TxType::Legacy,
+            success: true,
+            cumulative_gas_used: gas_used,
+            logs: vec![],
+        };
+        let parent = empty_replay_block(0, B256::ZERO);
+        let transactions = vec![transaction];
+        let receipts = [receipt.clone()];
+        let target = RecoveredBlock::new_unhashed(
+            reth_ethereum_primitives::Block {
+                header: Header {
+                    parent_hash: parent.hash(),
+                    ommers_hash: EMPTY_OMMER_ROOT_HASH,
+                    state_root: B256::ZERO,
+                    transactions_root: alloy_consensus::proofs::calculate_transaction_root(
+                        &transactions,
+                    ),
+                    receipts_root: reth_ethereum_primitives::calculate_receipt_root_no_memo(
+                        &receipts,
+                    ),
+                    withdrawals_root: Some(EMPTY_WITHDRAWALS),
+                    logs_bloom: Bloom::ZERO,
+                    difficulty: U256::ZERO,
+                    number: 1,
+                    gas_limit: 30_000_000,
+                    gas_used,
+                    timestamp: 2,
+                    base_fee_per_gas: Some(1),
+                    ..Default::default()
+                },
+                body: reth_ethereum_primitives::BlockBody {
+                    transactions,
+                    withdrawals: Some(Default::default()),
+                    ..Default::default()
+                },
+            },
+            vec![sender],
+        );
+
+        let provider =
+            MockEthProvider::<EthPrimitives>::new().with_chain_spec(chain_spec.as_ref().clone());
+        provider.add_account(sender, ExtendedAccount::new(0, U256::from(1_000_000_u64)));
+        provider.add_account(contract, ExtendedAccount::new(1, U256::ZERO).with_bytecode(code));
+        for block in [&parent, &target] {
+            provider.add_block(block.hash(), block.clone().into_block());
+        }
+        provider.add_receipts(parent.number(), vec![]);
+        provider.add_receipts(target.number(), vec![receipt]);
+        let cache = cache_replay_blocks(&provider, vec![target]).await;
+        let eth = EthApiBuilder::new(
+            provider,
+            testing_pool(),
+            NoopNetwork::default(),
+            TaikoEvmConfig::new(chain_spec),
+        )
+        .eth_cache(cache)
+        .blocking_task_pool(BlockingTaskPool::new(
+            BlockingTaskPool::builder().num_threads(1).build().unwrap(),
+        ))
+        .build();
+
+        let raw = DebankTraceExt::<_, InMemoryProofsStorage>::new(eth, None, 1)
+            .debank_block(BlockId::number(1))
+            .await
+            .expect("typed precompile error must not fail the block replay");
+        let output: DebankOutput = serde_json::from_str(raw.get()).unwrap();
+        assert_eq!(output.block_file.error_traces.len(), 1);
+        assert_eq!(output.block_file.error_traces[0].to_addr, precompile);
+        assert_eq!(output.block_file.error_traces[0].error, "invalid input length");
     }
 
     async fn assert_replay_resources_drained(resources: &ReplayTestResources, context: &str) {
