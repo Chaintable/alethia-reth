@@ -7,13 +7,19 @@ use alethia_reth_cli::{
 use alethia_reth_node::{
     TaikoNode,
     proof_history::{install_proof_history, install_proof_history_rpc},
-    rpc::eth::{
-        auth::{TaikoAuthExt, TaikoAuthExtApiServer},
-        eth::{TaikoExt, TaikoExtApiServer},
+    rpc::{
+        eth::{
+            auth::{TaikoAuthExt, TaikoAuthExtApiServer},
+            eth::{TaikoExt, TaikoExtApiServer},
+        },
+        proof_state::ProofHistoryStateProviderFactory,
+        trace::{DebankTraceApiServer, DebankTraceExt},
+        transport::merge_debank_trace_http_only,
     },
 };
 use reth::api::FullNodeComponents;
 use reth_rpc::eth::EthApiTypes;
+use reth_rpc_server_types::RethRpcModule;
 use tracing::info;
 
 #[global_allocator]
@@ -30,6 +36,7 @@ fn main() {
         async move |builder, ext_args| {
             info!(target: "reth::taiko::cli", "Launching Taiko node");
             let node_builder = builder.node(TaikoNode);
+            let verify_state_roots = ext_args.trace_debank_block_verify_state_roots;
             let (node_builder, proof_history_handles) =
                 install_proof_history(node_builder, ext_args.proof_history_config())?;
             let handle = node_builder
@@ -39,6 +46,29 @@ fn main() {
                     // Extend the RPC modules with `taiko_` namespace RPCs extensions.
                     let taiko_rpc_ext = TaikoExt::new(provider.clone());
                     ctx.modules.merge_configured(taiko_rpc_ext.into_rpc())?;
+
+                    // The heavy replay endpoint is HTTP-only: jsonrpsee does not cancel an
+                    // already-started WebSocket method when its client disconnects.
+                    if ctx.modules.module_config().contains_http(&RethRpcModule::Trace) {
+                        let max_concurrent_replays = ctx.config().rpc.rpc_max_tracing_requests;
+                        let eth_api = ctx.registry.eth_api().clone();
+                        let trace_proof_history =
+                            proof_history_handles.as_ref().map(|(storage, readiness)| {
+                                ProofHistoryStateProviderFactory::new(
+                                    eth_api.clone(),
+                                    storage.clone(),
+                                    readiness.clone(),
+                                )
+                            });
+                        let debank_trace = DebankTraceExt::new(
+                            eth_api,
+                            trace_proof_history,
+                            max_concurrent_replays,
+                        )
+                        .with_state_root_verification(verify_state_roots)
+                        .into_rpc();
+                        merge_debank_trace_http_only(ctx.modules, debank_trace)?;
+                    }
 
                     // Extend the RPC modules with `taikoAuth_` namespace RPCs extensions.
                     let taiko_auth_rpc_ext = TaikoAuthExt::new(

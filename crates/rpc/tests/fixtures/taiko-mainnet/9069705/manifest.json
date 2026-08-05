@@ -1,0 +1,90 @@
+{
+  "schemaVersion": 1,
+  "chainId": 167000,
+  "height": 9069705,
+  "blockHash": "0x88391dc1a9a682541c3a05fb99e2f057993ba3ead040717c76ef8ae6eea3a9f4",
+  "parentHash": "0xe89bfa9a0dd965c682d607720c0f23663e5227c26a567e514b8d146b62072f3c",
+  "parentStateRoot": "0x42ca05e380d9dfdc5e30a97abeb370384ec6a1304920a561e8872250f390b89f",
+  "stateRoot": "0xc8ddfefbacfe39f2fadcda29ffe27c4d4f789713feaf46e523df2fb432a7f3b8",
+  "source": {
+    "rpcUrl": "https://rpc.mainnet.taiko.xyz",
+    "clientVersion": "reth/v2.0.0-27bfdde/x86_64-unknown-linux-gnu",
+    "fetchedAt": "2026-07-26T10:52:36Z",
+    "blockHashesFetchedAt": "2026-07-26T10:52:36Z",
+    "blockSelection": "exact_hash_with_canonical_height_check",
+    "parentStateSelection": "eip1898_exact_parent_hash_require_canonical",
+    "blockHashSelection": "exact_number_with_parent_and_child_recheck"
+  },
+  "payloadSemantics": {
+    "rpcResultMembers": "verbatim",
+    "preserveAbsentNullAndEmpty": true,
+    "arrayOrder": "verbatim",
+    "blockHashWindow": "ascending_height_minus_256_through_parent"
+  },
+  "counts": {
+    "transactions": 1,
+    "receipts": 1,
+    "logs": 1,
+    "blockHashes": 256,
+    "accountProofs": 4,
+    "storageProofs": 5,
+    "codeQueries": 4,
+    "nonemptyCodes": 2
+  },
+  "files": {
+    "block.json": {
+      "sha256": "70b3ad0d67edc1cd723c11a5c9ee3bce481e0dd0a890f314880b1cd9fa6b964a",
+      "sizeBytes": 2631
+    },
+    "parent.json": {
+      "sha256": "ae3064b5bc1d173322eed3c3e4f80c6b55950c418e994b4fad3004199f414056",
+      "sizeBytes": 2631
+    },
+    "block-hashes.json": {
+      "sha256": "65d8100d66dae7e79fd61a588fa17caab8056e03b27b6897390fd088d804375b",
+      "sizeBytes": 28931
+    },
+    "raw-transactions.json": {
+      "sha256": "0948e1ccfc0816147f9c3a681c61429105fc2ffb185c01d09876fa9c6351627f",
+      "sizeBytes": 651
+    },
+    "receipts.json": {
+      "sha256": "b1a03e80f4858fcf717f885f62cfda05dfcc619a9de28851dc1b6dec521bed16",
+      "sizeBytes": 1846
+    },
+    "state-proofs.json": {
+      "sha256": "02cfacd2143fde3e91235ea39d752fd10a9789c561c0af6503ef6847297e4feb",
+      "sizeBytes": 58320
+    },
+    "codes.json": {
+      "sha256": "31d7f576a3e5977be55dabb8784f20d6ef55a421a34cecbc5e0b26049aac98e8",
+      "sizeBytes": 14268
+    }
+  },
+  "oracles": {
+    "blockFile": {
+      "status": "UNAVAILABLE",
+      "expectedFixture": null,
+      "reason": "No canonical blockfile exists for this height in the legacy S3 prefix, and the official RPC does not expose trace_debankBlock."
+    }
+  },
+  "validation": {
+    "status": "PASS",
+    "checks": [
+      "chain_id",
+      "canonical_block_hash",
+      "canonical_block_hash_window",
+      "parent_hash_and_state_root",
+      "child_state_receipts_and_transactions_roots",
+      "ordered_transaction_and_receipt_sets",
+      "raw_signed_transaction_hashes",
+      "eip1186_requested_key_set",
+      "parent_code_hashes",
+      "payload_sha256"
+    ]
+  },
+  "collector": {
+    "path": "scripts/collect_taiko_mainnet_fixtures.py",
+    "sha256": "1f38e42951e63272dcc6edfa5ab432008bc70fcdc879eca7587901bf859d74e6"
+  }
+}

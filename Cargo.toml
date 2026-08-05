@@ -56,7 +56,11 @@ clap = "4"
 derive_more = { version = "2", default-features = false, features = ["full"] }
 eyre = "0.6"
 futures-util = { version = "0.3", default-features = false }
+hash-db = "=0.15.2"
 humantime = "2.3"
+md5 = "0.7"
+plain_hasher = "0.2"
+socket2 = "0.6"
 
 # rpc
 jsonrpsee = "0.26.0"
@@ -128,19 +132,23 @@ reth-transaction-pool = { git = "https://github.com/paradigmxyz/reth", rev = "27
 reth-trie = { git = "https://github.com/paradigmxyz/reth", rev = "27bfddeada3953edc22759080a3659ccea62ca1f", default-features = false }
 reth-trie-common = { git = "https://github.com/paradigmxyz/reth", rev = "27bfddeada3953edc22759080a3659ccea62ca1f", default-features = false }
 reth-trie-db = { git = "https://github.com/paradigmxyz/reth", rev = "27bfddeada3953edc22759080a3659ccea62ca1f" }
+reth-trie-sparse = { git = "https://github.com/paradigmxyz/reth", rev = "27bfddeada3953edc22759080a3659ccea62ca1f", default-features = false }
+triehash = "0.8"
 
 reth-optimism-trie = { git = "https://github.com/ethereum-optimism/optimism", rev = "bcf489eaca2218e5063ca2d188a25f9c83ccd3f3", package = "reth-optimism-trie", default-features = false, features = ["serde-bincode-compat"] }
 
 # revm
 revm-database-interface = { version = "11.0.0", default-features = false }
+revm-inspectors = "0.39.0"
 
 # serialization
 serde = { version = "1.0", default-features = false }
-serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc", "raw_value"] }
 serde_with = { version = "3", default-features = false, features = ["macros"] }
 
 # crypto
 sha2 = { version = "0.10", default-features = false }
+sha1 = "0.10"
 
 # error handling
 thiserror = { version = "2.0.0", default-features = false }

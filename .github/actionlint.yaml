@@ -1,4 +1,4 @@
 self-hosted-runner:
   labels:
-    - arc-runner-set
-    - arc-runner-set-arm64
+    - ubuntu2404-linux-x86-64-16c
+    - ubuntu2204-arm64-16c
