@@ -13,6 +13,9 @@ use revm_inspectors::tracing::{
 use serde::{Deserialize, Serialize};
 use sha1::Digest;
 
+/// Error stored on a successful frame whose state was reverted by a failed ancestor.
+const PARENT_CALL_FAILED_ERROR: &str = "parent call failed";
+
 /// Hash adapter used by the complete-state trie root calculation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct DebankKeccakHasher;
@@ -481,10 +484,10 @@ struct Node {
     trace: DebankTrace,
     /// Ordered call/log members.
     members: Vec<Member>,
-    /// Whether this frame itself succeeded; trace classification ignores ancestors.
+    /// Whether this frame itself succeeded, before considering ancestor rollback.
     frame_succeeded: bool,
-    /// Whether this frame and every ancestor succeeded; log classification uses this.
-    events_survive: bool,
+    /// Whether this frame and every ancestor succeeded; trace and log classification use this.
+    effective_succeeded: bool,
 }
 
 /// Converts one inspector call node into its wire frame without tree metadata.
@@ -567,16 +570,20 @@ fn build_node(
     log_index: &mut usize,
 ) -> Result<Node, String> {
     let frame_succeeded = node.trace.success;
-    let events_survive = ancestors_succeeded && frame_succeeded;
+    let effective_succeeded = ancestors_succeeded && frame_succeeded;
     let exact_error = exact_errors
         .get(node.idx)
         .ok_or_else(|| format!("missing Geth error sidecar entry for trace node {}", node.idx))?
         .as_deref();
+    let mut trace = trace_from_node(node, exact_error)?;
+    if frame_succeeded && !ancestors_succeeded {
+        trace.error = PARENT_CALL_FAILED_ERROR.into();
+    }
     let mut output = Node {
-        trace: trace_from_node(node, exact_error)?,
+        trace,
         members: Vec::new(),
         frame_succeeded,
-        events_survive,
+        effective_succeeded,
     };
     output.trace.tx_id = tx_id.into();
     output.trace.parent_trace_id = parent_id.into();
@@ -597,11 +604,11 @@ fn build_node(
                     child,
                     nodes,
                     exact_errors,
-                    events_survive,
+                    effective_succeeded,
                     address,
                     log_index,
                 )?;
-                if child.trace.storage_change && child.trace.error.is_empty() {
+                if child.trace.storage_change && child.frame_succeeded {
                     output.trace.storage_change = true;
                 }
                 output.members.push(Member::Trace(Box::new(child)));
@@ -613,7 +620,7 @@ fn build_node(
                 event.pos_in_parent_trace = output.members.len();
                 event.id =
                     debank_id(&[&event.parent_trace_id, &event.pos_in_parent_trace.to_string()]);
-                if events_survive {
+                if effective_succeeded {
                     event.idx = *log_index;
                     *log_index += 1;
                 }
@@ -639,12 +646,15 @@ fn build_node(
             trace_address: address,
             ..Default::default()
         };
+        if !effective_succeeded {
+            trace.error = PARENT_CALL_FAILED_ERROR.into();
+        }
         trace.id = debank_id(&[tx_id, &trace.parent_trace_id, &position.to_string()]);
         output.members.push(Member::Trace(Box::new(Node {
             trace,
             members: Vec::new(),
             frame_succeeded: true,
-            events_survive,
+            effective_succeeded,
         })));
     }
     output.trace.subtraces =
@@ -652,14 +662,14 @@ fn build_node(
     Ok(output)
 }
 
-/// Appends one trace to the array selected by its own execution status.
+/// Appends one trace to the array selected by its effective execution status.
 fn append_trace(
     trace: DebankTrace,
-    frame_succeeded: bool,
+    effective_succeeded: bool,
     traces: &mut Vec<DebankTrace>,
     error_traces: &mut Vec<DebankTrace>,
 ) {
-    if frame_succeeded {
+    if effective_succeeded {
         traces.push(trace);
     } else {
         error_traces.push(trace);
@@ -679,21 +689,21 @@ fn flatten_descendants(
     for member in node.members {
         match member {
             Member::Trace(child) => {
-                direct_traces.push((child.trace.clone(), child.frame_succeeded));
+                direct_traces.push((child.trace.clone(), child.effective_succeeded));
                 flatten_descendants(*child, traces, error_traces, events, error_events);
             }
             Member::Log(event) => logs.push(event),
         }
     }
     for event in logs {
-        if node.events_survive {
+        if node.effective_succeeded {
             events.push(event);
         } else {
             error_events.push(event);
         }
     }
-    for (trace, frame_succeeded) in direct_traces {
-        append_trace(trace, frame_succeeded, traces, error_traces);
+    for (trace, effective_succeeded) in direct_traces {
+        append_trace(trace, effective_succeeded, traces, error_traces);
     }
 }
 
@@ -819,7 +829,7 @@ pub fn build_debank_traces(
     let mut error_traces = Vec::new();
     let mut events = Vec::new();
     let mut error_events = Vec::new();
-    append_trace(root.trace.clone(), root.frame_succeeded, &mut traces, &mut error_traces);
+    append_trace(root.trace.clone(), root.effective_succeeded, &mut traces, &mut error_traces);
     flatten_descendants(root, &mut traces, &mut error_traces, &mut events, &mut error_events);
     Ok((traces, error_traces, events, error_events))
 }
@@ -1565,24 +1575,77 @@ mod tests {
     }
 
     #[test]
-    fn formatter_moves_reverted_and_ancestor_reverted_logs_to_error_events() {
+    fn formatter_routes_failed_subtree_to_error_arrays() {
         let mut root = node(0, None, vec![1], false);
         root.logs = vec![CallLog::default()];
         root.ordering = vec![TraceMemberOrder::Call(0), TraceMemberOrder::Log(0)];
-        let mut child = node(1, Some(0), vec![], true);
+        let mut child = node(1, Some(0), vec![2], true);
+        child.trace.steps = vec![CallTraceStep {
+            pc: 0,
+            op: OpCode::SSTORE,
+            stack: None,
+            push_stack: None,
+            memory: None,
+            returndata: Bytes::new(),
+            gas_remaining: 0,
+            gas_refund_counter: 0,
+            gas_used: 0,
+            gas_cost: 0,
+            storage_change: None,
+            status: None,
+            immediate_bytes: None,
+            decoded: None,
+        }];
         child.logs = vec![CallLog::default()];
-        child.ordering = vec![TraceMemberOrder::Log(0)];
+        child.ordering = vec![TraceMemberOrder::Log(0), TraceMemberOrder::Call(0)];
+        let grandchild = node(2, Some(1), vec![], false);
         let mut arena = CallTraceArena::default();
-        *arena.nodes_mut() = vec![root, child];
+        *arena.nodes_mut() = vec![root, child, grandchild];
 
         let (traces, error_traces, events, error_events) =
             build_test_debank_traces(B256::repeat_byte(0x22), arena, &mut 0).unwrap();
-        assert_eq!(traces.len(), 1);
-        assert_eq!(traces[0].parent_trace_id, error_traces[0].id);
+        assert!(traces.is_empty());
         assert!(events.is_empty());
-        assert_eq!(error_traces.len(), 1);
+        assert_eq!(error_traces.len(), 3);
         assert_eq!(error_events.len(), 2);
         assert!(error_events.iter().all(|event| event.idx == 0));
+
+        let root = error_traces.iter().find(|trace| trace.trace_address.is_empty()).unwrap();
+        let child = error_traces.iter().find(|trace| trace.trace_address == vec![0]).unwrap();
+        let grandchild =
+            error_traces.iter().find(|trace| trace.trace_address == vec![0, 0]).unwrap();
+        assert_eq!(root.error, "execution reverted");
+        assert_eq!(child.error, "parent call failed");
+        assert_eq!(grandchild.error, "execution reverted");
+        assert!(root.storage_change);
+        assert!(child.storage_change);
+        assert_eq!(child.parent_trace_id, root.id);
+        assert_eq!(grandchild.parent_trace_id, child.id);
+    }
+
+    #[test]
+    fn formatter_routes_ancestor_reverted_selfdestruct_to_error_traces() {
+        let mut root = node(0, None, vec![1], false);
+        root.ordering = vec![TraceMemberOrder::Call(0)];
+        let mut child = node(1, Some(0), vec![], true);
+        child.trace.status = Some(InstructionResult::SelfDestruct);
+        child.trace.selfdestruct_address = Some(Address::repeat_byte(0xaa));
+        child.trace.selfdestruct_refund_target = Some(Address::repeat_byte(0xbb));
+        let mut arena = CallTraceArena::default();
+        *arena.nodes_mut() = vec![root, child];
+
+        let (traces, error_traces, _, _) =
+            build_test_debank_traces(B256::repeat_byte(0x23), arena, &mut 0).unwrap();
+        assert!(traces.is_empty());
+        assert_eq!(error_traces.len(), 3);
+
+        let child = error_traces.iter().find(|trace| trace.trace_address == vec![0]).unwrap();
+        let selfdestruct =
+            error_traces.iter().find(|trace| trace.trace_address == vec![0, 0]).unwrap();
+        assert_eq!(child.error, "parent call failed");
+        assert_eq!(selfdestruct.call_create_type, "suicide");
+        assert_eq!(selfdestruct.error, "parent call failed");
+        assert_eq!(selfdestruct.parent_trace_id, child.id);
     }
 
     #[test]
