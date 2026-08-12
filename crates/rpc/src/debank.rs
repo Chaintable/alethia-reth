@@ -576,7 +576,7 @@ fn build_node(
         .ok_or_else(|| format!("missing Geth error sidecar entry for trace node {}", node.idx))?
         .as_deref();
     let mut trace = trace_from_node(node, exact_error)?;
-    if frame_succeeded && !ancestors_succeeded {
+    if frame_succeeded && !ancestors_succeeded && trace.error.is_empty() {
         trace.error = PARENT_CALL_FAILED_ERROR.into();
     }
     let mut output = Node {
@@ -1645,6 +1645,29 @@ mod tests {
         assert_eq!(child.error, "parent call failed");
         assert_eq!(selfdestruct.call_create_type, "suicide");
         assert_eq!(selfdestruct.error, "parent call failed");
+        assert_eq!(selfdestruct.parent_trace_id, child.id);
+    }
+
+    #[test]
+    fn formatter_places_successful_child_selfdestruct_at_first_child_address() {
+        let mut root = node(0, None, vec![1], true);
+        root.ordering = vec![TraceMemberOrder::Call(0)];
+        let mut child = node(1, Some(0), vec![], true);
+        child.trace.status = Some(InstructionResult::SelfDestruct);
+        child.trace.selfdestruct_address = Some(Address::repeat_byte(0xaa));
+        child.trace.selfdestruct_refund_target = Some(Address::repeat_byte(0xbb));
+        let mut arena = CallTraceArena::default();
+        *arena.nodes_mut() = vec![root, child];
+
+        let (traces, error_traces, _, _) =
+            build_test_debank_traces(B256::repeat_byte(0x24), arena, &mut 0).unwrap();
+
+        assert!(error_traces.is_empty());
+        assert_eq!(traces.len(), 3);
+        let child = traces.iter().find(|trace| trace.trace_address == vec![0]).unwrap();
+        let selfdestruct = traces.iter().find(|trace| trace.trace_address == vec![0, 0]).unwrap();
+        assert_eq!(selfdestruct.call_create_type, "suicide");
+        assert!(selfdestruct.error.is_empty());
         assert_eq!(selfdestruct.parent_trace_id, child.id);
     }
 
