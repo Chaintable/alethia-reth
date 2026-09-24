@@ -10,8 +10,9 @@ use alloy_primitives::{Address, Log, U256};
 use reth_revm::{
     Inspector,
     context::{ContextTr, JournalTr},
+    handler::FrameResult,
     interpreter::{
-        CallInputs, CallOutcome, CreateInputs, CreateOutcome, Interpreter,
+        CallInputs, CallOutcome, CreateInputs, CreateOutcome, FrameInput, Interpreter,
         interpreter::EthInterpreter, interpreter_types::Jumps,
     },
 };
@@ -73,6 +74,16 @@ impl<I> ZkGasInspector<I> {
     /// Returns `None` when the active spec has no zk gas schedule (pre-Unzen specs).
     pub(crate) fn meter_mut(&mut self) -> Option<&mut ZkGasMeter<'static>> {
         self.metering.as_mut().map(|state| &mut state.meter)
+    }
+
+    /// Discards in-flight transaction metering state, if metering is enabled.
+    ///
+    /// Clears both the meter's per-transaction usage and the inspector's step bookkeeping so
+    /// nothing recorded by an aborted transaction can charge into the next one.
+    pub(crate) fn reset_transaction(&mut self) {
+        if let Some(metering) = &mut self.metering {
+            metering.reset_transaction();
+        }
     }
 }
 
@@ -148,12 +159,12 @@ where
         }
     }
 
-    /// Forwards emitted logs to the wrapped inspector without changing zk-gas accounting.
+    /// Forwards emitted logs to the wrapped inner inspector.
     fn log(&mut self, context: &mut TaikoEvmContext<DB>, log: Log) {
         self.inner.log(context, log);
     }
 
-    /// Forwards emitted logs with interpreter context to the wrapped inspector.
+    /// Forwards emitted logs (with interpreter access) to the wrapped inner inspector.
     fn log_full(
         &mut self,
         interp: &mut Interpreter<EthInterpreter>,
@@ -161,6 +172,15 @@ where
         log: Log,
     ) {
         self.inner.log_full(interp, context, log);
+    }
+
+    /// Forwards the generic frame-start hook to the wrapped inner inspector.
+    fn frame_start(
+        &mut self,
+        context: &mut TaikoEvmContext<DB>,
+        frame_input: &mut FrameInput,
+    ) -> Option<FrameResult> {
+        self.inner.frame_start(context, frame_input)
     }
 
     /// Marks CALL-family steps that actually opened a child frame.
@@ -248,7 +268,17 @@ where
         }
     }
 
-    /// Forwards contract destruction to the wrapped inspector.
+    /// Forwards the generic frame-end hook to the wrapped inner inspector.
+    fn frame_end(
+        &mut self,
+        context: &mut TaikoEvmContext<DB>,
+        frame_input: &FrameInput,
+        frame_result: &mut FrameResult,
+    ) {
+        self.inner.frame_end(context, frame_input, frame_result);
+    }
+
+    /// Forwards selfdestruct notifications to the wrapped inner inspector.
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         self.inner.selfdestruct(contract, target, value);
     }
@@ -280,6 +310,21 @@ impl ZkGasMeteringState {
             has_deferred_steps: false,
             max_active_depth: 0,
         }
+    }
+
+    /// Discards the in-flight transaction zk gas together with all per-frame step bookkeeping.
+    ///
+    /// The unwind of a failed transaction drains deferred steps through `call_end`/`create_end`
+    /// today, but that invariant lives in revm's frame handling; resetting everything here keeps
+    /// the transaction boundary self-contained regardless of how execution aborted.
+    fn reset_transaction(&mut self) {
+        self.meter.reset_transaction();
+        for index in 0..=self.max_active_depth {
+            self.pending_steps[index] = PendingStep::EMPTY;
+            self.deferred_steps[index] = None;
+        }
+        self.has_deferred_steps = false;
+        self.max_active_depth = 0;
     }
 
     /// Records the opcode and gas snapshot for the current frame depth.
@@ -482,6 +527,24 @@ mod tests {
         assert!(metering.has_deferred_steps);
         assert!(metering.deferred_steps[0].is_none());
         assert!(metering.deferred_steps[1].is_some());
+    }
+
+    #[test]
+    fn reset_transaction_clears_meter_and_step_bookkeeping() {
+        let mut metering = ZkGasMeteringState::new(&UNZEN_ZK_GAS_SCHEDULE);
+        metering.begin_step(1, 0x01, 10);
+        metering.defer_step(0, FinishedStep { opcode: 0xf1, step_gas: 5, spawned: true });
+        metering.defer_step(1, FinishedStep { opcode: 0x01, step_gas: 3, spawned: false });
+        metering.meter.charge_opcode(0x01, 3).expect("charge fits");
+
+        metering.reset_transaction();
+
+        assert_eq!(metering.meter.tx_zk_gas_used(), 0);
+        assert!(!metering.has_deferred_steps);
+        assert!(metering.deferred_steps[..2].iter().all(Option::is_none));
+        assert_eq!(metering.pending_steps[1].opcode, 0);
+        assert_eq!(metering.pending_steps[1].gas_remaining, 0);
+        assert_eq!(metering.max_active_depth, 0);
     }
 
     #[test]

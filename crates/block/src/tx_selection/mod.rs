@@ -146,7 +146,7 @@ where
         // 2. Filter by locals (if configured)
         if !config.locals.is_empty() && !config.locals.contains(&pool_tx.sender()) {
             // Mark as underpriced to skip this transaction and its dependents
-            best_txs.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Underpriced);
+            best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Underpriced);
             continue;
         }
 
@@ -154,7 +154,7 @@ where
         let tip = pool_tx.effective_tip_per_gas(config.base_fee);
         if tip.is_none_or(|t| t < config.min_tip as u128) {
             trace!(target: "tx_selection", ?pool_tx, "skipping transaction with insufficient tip");
-            best_txs.mark_invalid(&pool_tx, &InvalidPoolTransactionError::Underpriced);
+            best_txs.mark_invalid(&pool_tx, InvalidPoolTransactionError::Underpriced);
             continue;
         }
 
@@ -163,9 +163,7 @@ where
         if !is_allowed_tx_type(tx.inner()) {
             best_txs.mark_invalid(
                 &pool_tx,
-                &InvalidPoolTransactionError::Consensus(
-                    InvalidTransactionError::TxTypeNotSupported,
-                ),
+                InvalidPoolTransactionError::Consensus(InvalidTransactionError::TxTypeNotSupported),
             );
             continue;
         }
@@ -175,7 +173,7 @@ where
         if pool_tx.gas_limit() > config.gas_limit_per_list {
             best_txs.mark_invalid(
                 &pool_tx,
-                &InvalidPoolTransactionError::ExceedsGasLimit(
+                InvalidPoolTransactionError::ExceedsGasLimit(
                     pool_tx.gas_limit(),
                     config.gas_limit_per_list,
                 ),
@@ -183,7 +181,7 @@ where
             continue;
         }
         if da_size > config.max_da_bytes_per_list {
-            best_txs.mark_invalid(&pool_tx, &da_limit_error(da_size, config.max_da_bytes_per_list));
+            best_txs.mark_invalid(&pool_tx, da_limit_error(da_size, config.max_da_bytes_per_list));
             continue;
         }
 
@@ -203,7 +201,7 @@ where
             if lists.len() >= config.max_lists {
                 let err =
                     limit_exceeded_error(pool_tx.gas_limit(), exceeds_gas, exceeds_da, config);
-                best_txs.mark_invalid(&pool_tx, &err);
+                best_txs.mark_invalid(&pool_tx, err);
                 continue;
             }
             // Start a new list
@@ -225,14 +223,14 @@ where
             if exceeds_gas || exceeds_da.is_some() {
                 let err =
                     limit_exceeded_error(pool_tx.gas_limit(), exceeds_gas, exceeds_da, config);
-                best_txs.mark_invalid(&pool_tx, &err);
+                best_txs.mark_invalid(&pool_tx, err);
                 continue;
             }
         }
 
         // 7. Execute transaction
         let gas_used = match builder.execute_transaction(tx.clone()) {
-            Ok(gas_used) => gas_used,
+            Ok(gas_output) => gas_output.tx_gas_used(),
             Err(err) if is_zk_gas_limit_exceeded(&err) => {
                 trace!(target: "tx_selection", ?tx, "stopping selection after zk gas exhaustion");
                 break;
@@ -249,7 +247,7 @@ where
                     trace!(target: "tx_selection", %error, ?tx, "skipping invalid transaction and its descendants");
                     best_txs.mark_invalid(
                         &pool_tx,
-                        &InvalidPoolTransactionError::Consensus(
+                        InvalidPoolTransactionError::Consensus(
                             InvalidTransactionError::TxTypeNotSupported,
                         ),
                     );
@@ -287,8 +285,9 @@ mod tests {
     use crate::{
         executor::TaikoBlockExecutor,
         testutil::{
-            BENCH_LIMIT_TARGET, BENCH_SUCCESS_TARGET, ExecutorBackedBuilder, db_with_contracts,
-            recovered_tx, unzen_chain_spec, unzen_evm_env, unzen_execution_ctx,
+            BENCH_LIMIT_TARGET, BENCH_NEAR_LIMIT_TARGET, BENCH_SUCCESS_TARGET,
+            ExecutorBackedBuilder, db_with_contracts, recovered_tx, unzen_chain_spec,
+            unzen_evm_env, unzen_execution_ctx,
         },
     };
     use alethia_reth_evm::factory::TaikoEvmFactory;
@@ -297,6 +296,45 @@ mod tests {
     const BENCH_INCLUDED_CALLER: Address = Address::with_last_byte(0x31);
     const BENCH_LIMIT_CALLER: Address = Address::with_last_byte(0x32);
     const BENCH_LATE_CALLER: Address = Address::with_last_byte(0x33);
+
+    fn select_near_limit_transaction(reserved_zk_gas: u64) -> (SelectionOutcome, u64) {
+        let chain_spec = Arc::new(unzen_chain_spec());
+        let mut state = State::builder()
+            .with_database(db_with_contracts(&[(BENCH_INCLUDED_CALLER, 0)]))
+            .with_bundle_update()
+            .build();
+        let evm = TaikoEvmFactory.create_evm(&mut state, unzen_evm_env());
+        let ctx = unzen_execution_ctx();
+        let executor =
+            TaikoBlockExecutor::new(evm, ctx.clone(), chain_spec, RethReceiptBuilder::default());
+        let mut builder = ExecutorBackedBuilder { executor };
+        builder.executor.reserve_block_zk_gas(reserved_zk_gas).expect("test reserve should fit");
+        let pool = testing_pool();
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("test runtime");
+        rt.block_on(pool.add_consensus_transaction(
+            recovered_tx(BENCH_INCLUDED_CALLER, BENCH_NEAR_LIMIT_TARGET, 0, 10),
+            TransactionOrigin::External,
+        ))
+        .expect("near-limit tx should enter the pool");
+
+        let outcome = select_and_execute_pool_transactions(
+            &mut builder,
+            &pool,
+            &TxSelectionConfig {
+                base_fee: 0,
+                gas_limit_per_list: 30_000_000,
+                max_da_bytes_per_list: 1_000_000,
+                da_size_zlib_guard_bytes: 0,
+                max_lists: 1,
+                min_tip: 0,
+                locals: vec![],
+            },
+            || false,
+        )
+        .expect("near-limit selection should complete cleanly");
+
+        (outcome, ctx.finalized_block_zk_gas())
+    }
 
     #[test]
     fn tx_selection_does_not_preallocate_the_caller_supplied_list_limit() {
@@ -334,6 +372,24 @@ mod tests {
         };
         assert_eq!(lists.len(), 1);
         assert!(lists[0].transactions.is_empty());
+    }
+
+    #[test]
+    fn tx_selection_respects_reserved_anchor_zk_gas() {
+        let (without_reserve, without_reserve_zk_gas) = select_near_limit_transaction(0);
+        let SelectionOutcome::Completed(without_reserve) = without_reserve else {
+            panic!("selection should not cancel")
+        };
+        assert_eq!(without_reserve[0].transactions.len(), 1);
+        assert!(without_reserve_zk_gas > 98_000_000);
+        assert!(without_reserve_zk_gas <= 100_000_000);
+
+        let (with_reserve, with_reserve_zk_gas) = select_near_limit_transaction(2_000_000);
+        let SelectionOutcome::Completed(with_reserve) = with_reserve else {
+            panic!("selection should not cancel")
+        };
+        assert!(with_reserve[0].transactions.is_empty());
+        assert_eq!(with_reserve_zk_gas, 2_000_000);
     }
 
     #[test]

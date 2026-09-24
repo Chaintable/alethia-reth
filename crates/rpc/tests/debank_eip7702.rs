@@ -164,7 +164,7 @@ fn replay(timestamp: u64, authority_nonce: u64) -> Replay {
     let error = match executor.execute_transaction_without_commit(transaction) {
         Ok(output) => {
             assert!(output.result().result.is_success(), "type-4 transaction must succeed");
-            executor.commit_transaction(output).expect("commit type-4 transaction");
+            executor.commit_transaction(output);
             let (evm, result) = executor.finish().expect("finish Taiko execution");
             assert_eq!(result.receipts.len(), 1);
             drop(evm);

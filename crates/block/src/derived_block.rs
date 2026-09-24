@@ -51,6 +51,7 @@ fn attributes_from_derived_block(
         gas_limit: header.gas_limit,
         extra_data: header.extra_data.clone(),
         base_fee_per_gas,
+        parent_beacon_block_root: header.parent_beacon_block_root,
     })
 }
 
@@ -129,6 +130,7 @@ pub fn assemble_filtered_block(
         &bundle_state,
         &state_provider,
         state_root,
+        None,
     ))?;
 
     Ok(RecoveredBlock::new_unhashed(block, senders))

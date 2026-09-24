@@ -20,6 +20,7 @@ use alloy_primitives::{
     Address, B256, Bytes, keccak256,
     map::{AddressHashMap, B256Map},
 };
+use alloy_rlp::Decodable;
 use alloy_rpc_types_eth::{
     Block as RpcBlock, EIP1186AccountProofResponse, TransactionReceipt as RpcReceipt,
 };
@@ -49,8 +50,8 @@ use reth_rpc::EthApiBuilder;
 use reth_rpc_eth_types::{EthStateCache, cache::cache_new_blocks_task};
 use reth_transaction_pool::test_utils::testing_pool;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
-use reth_trie_common::{AccountProof, DecodedMultiProofV2, Nibbles, StorageProof};
-use reth_trie_sparse::{SparseStateTrie, provider::DefaultTrieNodeProviderFactory};
+use reth_trie_common::{AccountProof, DecodedMultiProofV2, StorageProof, TrieAccount};
+use reth_trie_sparse::{LeafUpdate, SparseStateTrie};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -466,7 +467,6 @@ fn assert_bundle_witness_coverage(bundle: &BundleState, proofs: &StateProofsFixt
 }
 
 fn sparse_root(decoded_proof: DecodedMultiProofV2, post_state: &HashedPostState) -> B256 {
-    let provider = DefaultTrieNodeProviderFactory;
     let mut trie = SparseStateTrie::new();
     trie.reveal_decoded_multiproof_v2(decoded_proof).expect("reveal the verified parent proof");
 
@@ -493,39 +493,46 @@ fn sparse_root(decoded_proof: DecodedMultiProofV2, post_state: &HashedPostState)
         if storage.wiped {
             trie.wipe_storage(*address).expect("wipe revealed storage");
         }
-        for (slot, value) in &storage.storage {
-            let path = Nibbles::unpack(*slot);
-            if value.is_zero() {
-                trie.remove_storage_leaf(*address, &path, &provider)
-                    .expect("remove revealed storage leaf");
+        let mut updates = B256Map::from_iter(storage.storage.iter().map(|(slot, value)| {
+            let encoded = if value.is_zero() {
+                Vec::new()
             } else {
-                trie.update_storage_leaf(
-                    *address,
-                    path,
-                    alloy_rlp::encode_fixed_size(value).to_vec(),
-                    &provider,
-                )
-                .expect("update revealed storage leaf");
-            }
-        }
+                alloy_rlp::encode_fixed_size(value).to_vec()
+            };
+            (*slot, LeafUpdate::Changed(encoded))
+        }));
+        trie.get_or_create_storage_trie_mut(*address)
+            .update_leaves(&mut updates, |_, _| {})
+            .expect("update revealed storage leaves");
+        assert!(updates.is_empty(), "storage update needs an unrevealed proof");
     }
     for (address, account) in &post_state.accounts {
-        match account {
-            None => trie
-                .remove_account_leaf(&Nibbles::unpack(*address), &provider)
-                .expect("remove revealed account"),
+        let encoded = match account {
+            None => Vec::new(),
             Some(account) => {
-                let keep = trie
-                    .update_account(*address, *account, &provider)
-                    .expect("update revealed account");
-                if !keep {
-                    trie.remove_account_leaf(&Nibbles::unpack(*address), &provider)
-                        .expect("remove empty account");
+                let storage_root = trie.storage_root(address).unwrap_or_else(|| {
+                    trie.get_account_value(address)
+                        .map(|value| {
+                            TrieAccount::decode(&mut &value[..])
+                                .expect("decode revealed account leaf")
+                                .storage_root
+                        })
+                        .unwrap_or(EMPTY_ROOT_HASH)
+                });
+                if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
+                    Vec::new()
+                } else {
+                    alloy_rlp::encode((*account).into_trie_account(storage_root))
                 }
             }
-        }
+        };
+        let mut updates = B256Map::from_iter([(*address, LeafUpdate::Changed(encoded))]);
+        trie.trie_mut()
+            .update_leaves(&mut updates, |_, _| {})
+            .expect("update revealed account leaf");
+        assert!(updates.is_empty(), "account update needs an unrevealed proof");
     }
-    trie.root(&provider).expect("calculate sparse state root without database fallback")
+    trie.root().expect("calculate sparse state root without database fallback")
 }
 
 async fn cache_replay_block(
@@ -748,7 +755,7 @@ fn replay_fixture(network: FixtureNetwork, height: u64) -> BlockStorageDiff {
             transaction.tx_hash(),
             output.result().result
         );
-        executor.commit_transaction(output).expect("commit canonical transaction");
+        executor.commit_transaction(output);
     }
     let (_, execution) = executor.finish().expect("finish canonical Taiko replay");
     assert_eq!(execution.receipts, stored_receipts);

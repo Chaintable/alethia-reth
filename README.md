@@ -1,7 +1,7 @@
 # Chaintable Alethia-Reth
 
 > Standalone downstream of [taikoxyz/alethia-reth](https://github.com/taikoxyz/alethia-reth),
-> based on the official `v1.3.0` release (`7ddf2b3c7e278d7d5f9c23aab528bb70ed2a1949`).
+> based on the official `v1.4.1` release (`0fb47d966f290c032e0ce88bdc8877121768d253`).
 
 This repository adds Chaintable's validated HTTP `trace_debankBlock` replay endpoint while
 preserving Alethia-Reth's upstream license and its lockfile-pinned Paradigm Reth dependencies.
@@ -90,7 +90,6 @@ Use `--chain` with one of the supported presets:
 - `mainnet`
 - `taiko-hoodi`
 - `devnet`
-- `masaya`
 
 ### Common Runtime Flags
 
