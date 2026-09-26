@@ -8,13 +8,54 @@ use reth_revm::{
         },
     },
     handler::{EthFrame, Handler, PrecompileProvider},
-    inspector::{InspectorHandler, JournalExt},
+    inspector::{InspectorEvmTr, InspectorHandler, JournalExt},
     interpreter::{InterpreterResult, interpreter::EthInterpreter},
     state::EvmState,
 };
 use revm_database_interface::Database;
 
 use crate::{evm::TaikoEvm, handler::TaikoEvmHandler};
+
+/// Inspected-execution plumbing so [`TaikoEvmHandler`] can drive [`TaikoEvm`] through
+/// `inspect_run`. Inspected frames themselves run revm's default inspected interpreter loop
+/// (with `ZkGasInspector` hooks); only the accessors are delegated here. That default loop
+/// materializes exceptional halts before `step_end`, matching the production loop's charge
+/// point (see `zk_gas::runtime::run_metered_plain`).
+impl<CTX, INSP, P> InspectorEvmTr for TaikoEvm<CTX, INSP, P>
+where
+    CTX: ContextSetters<Journal: JournalTr<State = EvmState> + JournalExt>,
+    INSP: Inspector<CTX, EthInterpreter>,
+    P: PrecompileProvider<CTX, Output = InterpreterResult>,
+{
+    /// Inspector installed on the wrapped revm engine.
+    type Inspector = INSP;
+
+    /// Returns shared references to every component required by inspected execution.
+    fn all_inspector(
+        &self,
+    ) -> (
+        &Self::Context,
+        &Self::Instructions,
+        &Self::Precompiles,
+        &reth_revm::context::FrameStack<Self::Frame>,
+        &Self::Inspector,
+    ) {
+        self.inner.all_inspector()
+    }
+
+    /// Returns mutable references to every component required by inspected execution.
+    fn all_mut_inspector(
+        &mut self,
+    ) -> (
+        &mut Self::Context,
+        &mut Self::Instructions,
+        &mut Self::Precompiles,
+        &mut reth_revm::context::FrameStack<Self::Frame>,
+        &mut Self::Inspector,
+    ) {
+        self.inner.all_mut_inspector()
+    }
+}
 
 // Trait that allows to replay and transact the transaction, we
 // use [`TaikoEvmHandler`] to handle the transactions execution, besides
@@ -60,9 +101,13 @@ where
     fn replay(
         &mut self,
     ) -> Result<ExecResultAndState<Self::ExecutionResult, Self::State>, Self::Error> {
-        TaikoEvmHandler::<_, _, EthFrame>::new(self.extra_execution_ctx.clone())
-            .run(self)
-            .map(|result| ResultAndState::new(result, self.finalize()))
+        let result: Result<_, Self::Error> =
+            TaikoEvmHandler::<_, _, EthFrame>::new(self.extra_execution_ctx.clone()).run(self);
+        // Finalize before propagating errors, mirroring revm's `ExecuteEvm::transact`: payload
+        // building and derived-block execution skip invalid transactions and keep executing on
+        // this EVM, and an errored run must not leave the journal for the next transaction.
+        let state = self.finalize();
+        Ok(ResultAndState::new(result?, state))
     }
 }
 

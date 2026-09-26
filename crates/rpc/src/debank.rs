@@ -579,12 +579,7 @@ fn build_node(
     if frame_succeeded && !ancestors_succeeded && trace.error.is_empty() {
         trace.error = PARENT_CALL_FAILED_ERROR.into();
     }
-    let mut output = Node {
-        trace,
-        members: Vec::new(),
-        frame_succeeded,
-        effective_succeeded,
-    };
+    let mut output = Node { trace, members: Vec::new(), frame_succeeded, effective_succeeded };
     output.trace.tx_id = tx_id.into();
     output.trace.parent_trace_id = parent_id.into();
     output.trace.pos_in_parent_trace = position;

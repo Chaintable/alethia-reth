@@ -178,7 +178,7 @@ fn replay_with_tracing(difficulty: U256) -> ReplayObservation {
             .expect("execute canonical transaction with tracing");
         trace_nodes.push(executor.evm().inspector().traces().nodes().len());
         executor.evm_mut().inspector_mut().fuse();
-        executor.commit_transaction(output).expect("commit traced canonical transaction");
+        executor.commit_transaction(output);
         committed_zk_gas.push(zk_gas_probe.finalized_block_zk_gas());
     }
     executor.evm_mut().set_inspector_enabled(false);

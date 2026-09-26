@@ -34,6 +34,29 @@ impl<'a> ZkGasMeter<'a> {
         }
     }
 
+    /// Test-only constructor that seeds finalized and in-flight usage directly.
+    ///
+    /// The charge path caps in-flight usage at the remaining block budget, so boundary states
+    /// around (and past) the block limit cannot be reached through public charging — this
+    /// bypass exists to pin [`Self::commit_would_exceed_block_limit`] against
+    /// [`Self::commit_transaction`].
+    #[cfg(test)]
+    pub(crate) const fn with_usage_for_tests(
+        schedule: &'a ZkGasSchedule,
+        block_zk_gas_used: u64,
+        tx_zk_gas_used: u64,
+    ) -> Self {
+        Self {
+            schedule,
+            block_zk_gas_used,
+            tx_zk_gas_used,
+            remaining_zk_gas: schedule
+                .block_limit
+                .saturating_sub(block_zk_gas_used)
+                .saturating_sub(tx_zk_gas_used),
+        }
+    }
+
     /// Resets the in-flight zk gas for the current transaction.
     pub fn reset_transaction(&mut self) {
         self.tx_zk_gas_used = 0;
@@ -52,6 +75,31 @@ impl<'a> ZkGasMeter<'a> {
         self.block_zk_gas_used = next_block;
         self.tx_zk_gas_used = 0;
         Ok(())
+    }
+
+    /// Reserves finalized block zk gas without charging the in-flight transaction.
+    ///
+    /// This is intended for simulations that must account for a mandatory transaction they
+    /// cannot execute directly. The reservation is rejected without mutation when it exceeds
+    /// the remaining block budget or overflows the finalized block total.
+    pub fn reserve_block_budget(&mut self, amount: u64) -> Result<(), ZkGasOutcome> {
+        let next_block =
+            self.block_zk_gas_used.checked_add(amount).ok_or(ZkGasOutcome::LimitExceeded)?;
+        if next_block > self.schedule.block_limit || amount > self.remaining_zk_gas {
+            return Err(ZkGasOutcome::LimitExceeded);
+        }
+        self.block_zk_gas_used = next_block;
+        self.remaining_zk_gas -= amount;
+        Ok(())
+    }
+
+    /// Returns `true` when [`Self::commit_transaction`] would fail: committing the in-flight
+    /// transaction zk gas would exceed the block budget or overflow `u64` arithmetic.
+    pub const fn commit_would_exceed_block_limit(&self) -> bool {
+        match self.block_zk_gas_used.checked_add(self.tx_zk_gas_used) {
+            Some(next_block) => next_block > self.schedule.block_limit,
+            None => true,
+        }
     }
 
     /// Returns the finalized zk gas from fully committed transactions.

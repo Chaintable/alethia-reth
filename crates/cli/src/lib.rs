@@ -16,14 +16,14 @@ use reth_db::DatabaseEnv;
 use reth_ethereum_forks::Hardforks;
 use reth_node_api::{NodePrimitives, NodeTypes};
 use reth_node_builder::{NodeBuilder, WithLaunchContext};
-use reth_tracing::FileWorkerGuard;
+use reth_tracing::TracingGuards;
 use tracing::info;
 
 use alethia_reth_block::config::TaikoEvmConfig;
 use alethia_reth_chainspec::spec::TaikoChainSpec;
 use alethia_reth_node::{
     TaikoNode,
-    components::ProviderTaikoBlockReader,
+    components::{ProviderTaikoBlockReader, reject_jit_args},
     consensus::validation::TaikoBeaconConsensus,
     proof_history::{
         DEFAULT_PROOF_HISTORY_MAX_STARTUP_PRUNE_BLOCKS,
@@ -266,6 +266,10 @@ impl<
                 runner.run_command_until_exit(|ctx| command.execute::<TaikoNode>(ctx))
             }
             Commands::ReExecute(command) => {
+                // reth's re-execute parses its own `--jit` args and applies them through
+                // `ConfigureEvm::with_jit_support`, a no-op for the Taiko config. Reject the
+                // request up front, exactly like the node's executor builder does.
+                reject_jit_args(&command.jit)?;
                 runner.run_until_ctrl_c(command.execute::<TaikoNode>(components, rt))
             }
         }
@@ -273,9 +277,9 @@ impl<
 
     /// Initializes tracing with the configured options.
     ///
-    /// If file logging is enabled, this function returns a guard that must be kept alive to ensure
+    /// If file logging is enabled, the returned [`TracingGuards`] must be kept alive to ensure
     /// that all logs are flushed to disk.
-    pub fn init_tracing(&self) -> eyre::Result<Option<FileWorkerGuard>> {
+    pub fn init_tracing(&self) -> eyre::Result<TracingGuards> {
         let guard = self.inner.logs.init_tracing()?;
         Ok(guard)
     }

@@ -202,7 +202,7 @@ impl GethErrorInspector {
         };
 
         if let Some(exact_error) = exact_error {
-            if !result.is_some_and(InstructionResult::is_error) {
+            if !result.is_some_and(InstructionResult::is_halt) {
                 self.record_fault(format!(
                     "opcode {:#x} failed Geth precheck but did not halt the frame",
                     pending.opcode
@@ -274,7 +274,7 @@ impl GethErrorInspector {
             self.record_fault("call/create frame ended without a matching start");
             return;
         };
-        if frame.exact_error.is_some() && !result.is_error() {
+        if frame.exact_error.is_some() && !result.is_halt() {
             self.record_fault(format!(
                 "trace node {} captured an opcode error but ended with {result:?}",
                 frame.node_index
@@ -562,7 +562,7 @@ fn geth_precheck_error(opcode_byte: u8, spec: SpecId, stack_len: usize) -> Optio
 
 /// Returns whether an opcode exists in the active Geth jump table for `spec`.
 ///
-/// This table is pinned to the conditional opcodes in the lockfile's REVM 35 interpreter. Taiko
+/// This table is pinned to the conditional opcodes in the lockfile's REVM 41 interpreter. Taiko
 /// maps all historical forks through Shasta to Shanghai and Unzen to Osaka, but older and future
 /// minima are retained so known post-Osaka opcodes remain invalid instead of receiving stack
 /// validation.
@@ -572,7 +572,7 @@ fn opcode_is_active(opcode_byte: u8, spec: SpecId) -> bool {
         opcode::RETURNDATASIZE | opcode::RETURNDATACOPY | opcode::STATICCALL | opcode::REVERT => {
             SpecId::BYZANTIUM
         }
-        opcode::SHL | opcode::SHR | opcode::SAR | opcode::EXTCODEHASH => SpecId::CONSTANTINOPLE,
+        opcode::SHL | opcode::SHR | opcode::SAR | opcode::EXTCODEHASH => SpecId::PETERSBURG,
         opcode::CREATE2 => SpecId::PETERSBURG,
         opcode::CHAINID | opcode::SELFBALANCE => SpecId::ISTANBUL,
         opcode::BASEFEE => SpecId::LONDON,
@@ -594,7 +594,9 @@ mod tests {
     use reth_revm::{
         bytecode::Bytecode,
         interpreter::{
-            InputsImpl, SharedMemory, host::DummyHost, instructions::instruction_table,
+            InputsImpl, SharedMemory,
+            host::DummyHost,
+            instructions::{gas_table_spec, instruction_table},
             interpreter::ExtBytecode,
         },
     };
@@ -631,7 +633,13 @@ mod tests {
         inspector.start_frame();
         inspector.inspect_step(&mut interpreter, |_| None);
         let mut host = DummyHost::new(spec);
-        interpreter.step(&instruction_table::<EthInterpreter, DummyHost>(), &mut host);
+        if let Err(result) = interpreter.step(
+            &instruction_table::<EthInterpreter, DummyHost>(),
+            &gas_table_spec(spec),
+            &mut host,
+        ) {
+            interpreter.halt(result);
+        }
         inspector.inspect_step_end(&mut interpreter);
         let result = interpreter.bytecode.instruction_result().expect("terminal opcode result");
         inspector.end_frame(result);

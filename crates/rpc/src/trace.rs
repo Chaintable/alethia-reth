@@ -758,7 +758,7 @@ where
                     let db = StateProviderDatabase::new(&*state_provider);
                     let mut state = State::builder().with_database(db).with_bundle_update().build();
 
-                    // `executor_for_block` installs a no-op inspector. Mirror its v1.3 assembly
+                    // `executor_for_block` installs a no-op inspector. Mirror its block assembly
                     // with the production block environment and execution context so the only
                     // difference is the DeBank tracing inspector.
                     let evm_config = this.evm_config();
@@ -862,13 +862,7 @@ where
                             probe.phase_reached(ReplayTestPhase::FormatterCompleted);
                         }
                         check_cancelled(&cancel, "after formatter")?;
-                        executor.commit_transaction(result).map_err(|error| {
-                            rpc_error(
-                                EXECUTION_CONSENSUS_MISMATCH,
-                                "EXECUTION_CONSENSUS_MISMATCH",
-                                error,
-                            )
-                        })?;
+                        executor.commit_transaction(result);
                         check_cancelled(&cancel, "after transaction commit")?;
                     }
                     executor.evm_mut().set_inspector_enabled(false);

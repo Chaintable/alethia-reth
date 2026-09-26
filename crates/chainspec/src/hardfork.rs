@@ -8,21 +8,21 @@ use reth_ethereum_forks::{ChainHardforks, EthereumHardforks};
 use crate::spec::TaikoChainSpec;
 
 hardfork!(
-  /// The name of a Taiko hardfork.
-  ///
-  /// When building a list of hardforks for a chain, it's still expected to zip with
-  /// [`EthereumHardfork`].
-  #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-  TaikoHardfork {
-      /// Ontake protocol upgrade.
-      Ontake,
-      /// Pacaya protocol upgrade.
-      Pacaya,
-      /// Shasta protocol upgrade.
-      Shasta,
-      /// Unzen protocol upgrade.
-      Unzen,
-  }
+    /// The name of a Taiko hardfork.
+    ///
+    /// When building a list of hardforks for a chain, it's still expected to zip with
+    /// [`EthereumHardfork`].
+    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+    TaikoHardfork {
+        /// Ontake protocol upgrade.
+        Ontake,
+        /// Pacaya protocol upgrade.
+        Pacaya,
+        /// Shasta protocol upgrade.
+        Shasta,
+        /// Unzen protocol upgrade.
+        Unzen,
+    }
 );
 
 /// Extends [`EthereumHardforks`] with Taiko network helper methods.
@@ -88,16 +88,6 @@ pub static TAIKO_HOODI_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
 
 /// Taiko Devnet list of hardforks.
 pub static TAIKO_DEVNET_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
-    ChainHardforks::new(extend_with_shared_hardforks(vec![
-        (TaikoHardfork::Ontake.boxed(), ForkCondition::Block(0)),
-        (TaikoHardfork::Pacaya.boxed(), ForkCondition::Block(0)),
-        (TaikoHardfork::Shasta.boxed(), ForkCondition::Timestamp(0)),
-        (TaikoHardfork::Unzen.boxed(), ForkCondition::Timestamp(0)),
-    ]))
-});
-
-/// Taiko Masaya list of hardforks.
-pub static TAIKO_MASAYA_HARDFORKS: LazyLock<ChainHardforks> = LazyLock::new(|| {
     ChainHardforks::new(extend_with_shared_hardforks(vec![
         (TaikoHardfork::Ontake.boxed(), ForkCondition::Block(0)),
         (TaikoHardfork::Pacaya.boxed(), ForkCondition::Block(0)),
@@ -302,22 +292,5 @@ mod test {
         let unzen = TAIKO_HOODI_HARDFORKS.fork(TaikoHardfork::Unzen);
         assert!(unzen.is_timestamp(), "unzen activation should be timestamp-based");
         assert_eq!(unzen, ForkCondition::Timestamp(1_781_787_600));
-    }
-
-    #[test]
-    fn test_masaya_shasta_uses_timestamp_activation() {
-        let shasta = TAIKO_MASAYA_HARDFORKS.fork(TaikoHardfork::Shasta);
-        assert!(shasta.is_timestamp(), "shasta activation should be timestamp-based");
-        assert_eq!(shasta, ForkCondition::Timestamp(0));
-    }
-
-    #[test]
-    fn test_masaya_unzen_activates_at_genesis() {
-        let unzen = TAIKO_MASAYA_HARDFORKS.fork(TaikoHardfork::Unzen);
-        assert_eq!(
-            unzen,
-            ForkCondition::Timestamp(0),
-            "post-reset Masaya forks into Unzen at genesis"
-        );
     }
 }

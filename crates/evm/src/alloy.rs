@@ -6,22 +6,23 @@ use alloy_primitives::{Address, Bytes, TxKind, U256};
 // Re-export from primitives so downstream consumers can use the lighter crate.
 pub use alethia_reth_primitives::addresses::TAIKO_GOLDEN_TOUCH_ADDRESS;
 use reth_revm::{
-    Context, ExecuteEvm, InspectEvm, Inspector,
+    Context, Inspector,
     context::{
-        BlockEnv, CfgEnv, ContextTr, JournalTr, TxEnv,
+        BlockEnv, CfgEnv, ContextSetters, ContextTr, JournalTr, TxEnv,
         result::{
             EVMError, ExecutionResult, HaltReason, Output, ResultAndState, ResultGas, SuccessReason,
         },
     },
-    handler::PrecompileProvider,
-    interpreter::InterpreterResult,
+    handler::{EthFrame, Handler, PrecompileProvider},
+    inspector::InspectorHandler,
+    interpreter::{InterpreterResult, interpreter::EthInterpreter},
     state::EvmState,
 };
 use tracing::debug;
 
 use crate::{
-    evm::TaikoEvm,
-    handler::get_treasury_address,
+    evm::{TaikoEvm, TaikoEvmExtraExecutionCtx},
+    handler::{TaikoEvmHandler, get_treasury_address},
     spec::TaikoSpecId,
     zk_gas::{
         adapter::ZkGasInspector,
@@ -32,36 +33,61 @@ use crate::{
 /// Maximum transaction gas limit enforced once Osaka/Unzen semantics are active.
 const MAX_SYSTEM_CALL_GAS_LIMIT: u64 = 16_777_216;
 
+/// Taiko EVM implementation wrapped by the Alloy adapter.
+type BaseTaikoEvm<DB, I, P> = TaikoEvm<TaikoEvmContext<DB>, ZkGasInspector<I>, P>;
+
 /// A wrapper around the Taiko EVM that implements the `Evm` trait in `alloy_evm`.
 pub struct TaikoEvmWrapper<DB: Database, I, P> {
     /// Wrapped Taiko EVM instance implementing execution behavior.
-    inner: TaikoEvm<TaikoEvmContext<DB>, ZkGasInspector<I>, P>,
+    inner: BaseTaikoEvm<DB, I, P>,
     /// Whether to run transactions through the inspector execution path.
     inspect: bool,
+    /// Whether [`Self::maybe_derive_anchor_execution_ctx`] may install a derived anchor
+    /// context for replay-style execution. Enabled by default; the block executor turns it off
+    /// because it installs the authoritative context through the anchor system call, and a
+    /// missing pre-execution initialization must keep failing loudly there.
+    derive_anchor_ctx: bool,
+    /// Whether [`Evm::transact_raw`] discards in-flight zk gas before executing. Enabled by
+    /// default so RPC-style consumers that reuse one EVM never accumulate zk gas across
+    /// transacts: `eth_estimateGas`'s repeated runs of the same transaction meter from zero,
+    /// and multi-transaction simulations over one raw EVM (`eth_callBundle`, the intra-block
+    /// replay helpers) get a fresh per-transaction budget rather than a consensus-shaped
+    /// cumulative one. Consensus-shaped execution (including `eth_simulateV1`) runs through
+    /// the block executor, which turns this off because it owns the per-transaction bracket
+    /// (reset, intrinsic charge, commit) and an entry reset here would wipe the intrinsic zk
+    /// gas it charges before execution.
+    reset_zk_gas_per_transact: bool,
 }
 
 impl<DB: Database, I, P> TaikoEvmWrapper<DB, I, P> {
     /// Creates a new [`TaikoEvmWrapper`] instance.
-    pub const fn new(
-        evm: TaikoEvm<TaikoEvmContext<DB>, ZkGasInspector<I>, P>,
-        inspect: bool,
-    ) -> Self {
-        Self { inner: evm, inspect }
+    pub const fn new(evm: BaseTaikoEvm<DB, I, P>, inspect: bool) -> Self {
+        Self { inner: evm, inspect, derive_anchor_ctx: true, reset_zk_gas_per_transact: true }
     }
 
     /// Consumes self and return the inner EVM instance.
-    pub fn into_inner(self) -> TaikoEvm<TaikoEvmContext<DB>, ZkGasInspector<I>, P> {
+    pub fn into_inner(self) -> BaseTaikoEvm<DB, I, P> {
         self.inner
     }
 
+    /// Returns the wrapped Taiko EVM.
+    const fn base_evm(&self) -> &BaseTaikoEvm<DB, I, P> {
+        &self.inner
+    }
+
+    /// Returns the wrapped Taiko EVM mutably.
+    fn base_evm_mut(&mut self) -> &mut BaseTaikoEvm<DB, I, P> {
+        &mut self.inner
+    }
+
     /// Provides a reference to the EVM context.
-    pub const fn ctx(&self) -> &TaikoEvmContext<DB> {
-        &self.inner.inner.ctx
+    pub fn ctx(&self) -> &TaikoEvmContext<DB> {
+        &self.base_evm().inner.ctx
     }
 
     /// Provides a mutable reference to the EVM context.
     pub fn ctx_mut(&mut self) -> &mut TaikoEvmContext<DB> {
-        &mut self.inner.inner.ctx
+        &mut self.base_evm_mut().inner.ctx
     }
 
     /// Returns a reference to the active zk gas meter, if metering is enabled.
@@ -69,7 +95,8 @@ impl<DB: Database, I, P> TaikoEvmWrapper<DB, I, P> {
     /// Returns `None` when the active spec/chain combination has no zk gas schedule
     /// (pre-Unzen specs).
     pub fn meter(&self) -> Option<&ZkGasMeter<'static>> {
-        self.inner.zk_gas_meter().or_else(|| self.inner.inner.inspector.meter())
+        let evm = self.base_evm();
+        evm.zk_gas_meter().or_else(|| evm.inner.inspector.meter())
     }
 
     /// Returns a mutable reference to the active zk gas meter, if metering is enabled.
@@ -77,24 +104,107 @@ impl<DB: Database, I, P> TaikoEvmWrapper<DB, I, P> {
     /// Returns `None` when the active spec/chain combination has no zk gas schedule
     /// (pre-Unzen specs).
     pub fn meter_mut(&mut self) -> Option<&mut ZkGasMeter<'static>> {
-        if self.inner.zk_gas_meter().is_some() {
-            self.inner.zk_gas_meter_mut()
+        if self.base_evm().zk_gas_meter().is_some() {
+            self.base_evm_mut().zk_gas_meter_mut()
         } else {
-            self.inner.inner.inspector.meter_mut()
+            self.base_evm_mut().inner.inspector.meter_mut()
         }
+    }
+
+    /// Derives and installs the anchor execution context from database state when no
+    /// authoritative context is present and the incoming transaction is anchor-shaped
+    /// (golden touch calling the network treasury).
+    ///
+    /// Block execution installs the context through the anchor system call before any
+    /// transaction runs, so this only fires on replay-style paths (`debug_trace*`, `trace_*`
+    /// and the `eth_call` family) that execute block transactions without the block executor.
+    /// Without a context those paths fail the anchor's balance check, which is what made every
+    /// trace of a real block error with `insufficient funds`.
+    ///
+    /// The golden-touch nonce is snapshotted on first derivation and the context is kept for
+    /// the EVM's lifetime, mirroring the per-block snapshot the system call takes: a crafted
+    /// golden-touch transaction later in the block does not match the snapshot nonce and keeps
+    /// consensus semantics (normal balance check).
+    ///
+    /// That protection is per EVM instance. Tracing helpers that create a fresh EVM per
+    /// transaction (`debug_traceBlock*`, and the target EVM of `debug_traceTransaction`)
+    /// re-derive from the already-advanced database nonce, so a deliberately crafted
+    /// golden-touch -> treasury transaction placed after the anchor is still wrongly exempted
+    /// in those traces while consensus charges it fees. Real anchors are unaffected in every
+    /// topology because the anchor system-call marker commits no state. Closing that gap needs
+    /// the block-start nonce carried through the EVM environment; see
+    /// `fresh_replay_evm_still_exempts_crafted_golden_touch_tx_after_anchor`.
+    fn maybe_derive_anchor_execution_ctx(&mut self, tx: &TxEnv) -> Result<(), EVMError<DB::Error>> {
+        if !self.derive_anchor_ctx || self.base_evm().extra_execution_ctx.is_some() {
+            return Ok(());
+        }
+        let golden_touch = Address::from(TAIKO_GOLDEN_TOUCH_ADDRESS);
+        if tx.caller != golden_touch ||
+            tx.kind != TxKind::Call(get_treasury_address(self.ctx().cfg.chain_id))
+        {
+            return Ok(());
+        }
+        let nonce = self
+            .ctx_mut()
+            .journaled_state
+            .database
+            .basic(golden_touch)
+            .map_err(EVMError::Database)?
+            .map_or(0, |account| account.nonce);
+        self.base_evm_mut().extra_execution_ctx =
+            Some(TaikoEvmExtraExecutionCtx::derived(golden_touch, nonce));
+        Ok(())
+    }
+}
+
+/// EVM extension trait controlling the replay-only anchor context derivation.
+pub trait TaikoAnchorEvm {
+    /// Enables or disables on-the-fly anchor context derivation for replay-style execution.
+    ///
+    /// The block executor disables it before executing a block: it installs the authoritative
+    /// context through the anchor system call, and executing an anchor without that
+    /// initialization must keep failing loudly rather than silently falling back to derived
+    /// replay semantics.
+    fn set_anchor_ctx_derivation_enabled(&mut self, enabled: bool);
+}
+
+impl<DB: Database, I, P> TaikoAnchorEvm for TaikoEvmWrapper<DB, I, P> {
+    /// Enables or disables on-the-fly anchor context derivation for replay-style execution.
+    fn set_anchor_ctx_derivation_enabled(&mut self, enabled: bool) {
+        self.derive_anchor_ctx = enabled;
     }
 }
 
 /// EVM extension trait for reading and mutating the zk gas meter state.
 pub trait TaikoZkGasEvm {
+    /// Enables or disables the automatic in-flight zk gas reset at the start of every transact.
+    ///
+    /// Enabled by default: RPC-style consumers reuse one EVM across transacts
+    /// (`eth_estimateGas` re-runs the same transaction; `eth_callBundle` and the intra-block
+    /// replay helpers execute a transaction sequence), and each run must meter from zero
+    /// instead of inheriting earlier runs' usage. The block executor disables it because it
+    /// drives the meter through its own reset/intrinsic-charge/commit bracket, which an entry
+    /// reset would corrupt by wiping the intrinsic charged before execution.
+    fn set_per_transact_zk_gas_reset_enabled(&mut self, enabled: bool);
+
     /// Discards any in-flight zk gas recorded for the current transaction.
     fn reset_transaction_zk_gas(&mut self);
 
     /// Commits the current transaction's zk gas into the block total and returns the new total.
     fn commit_transaction_zk_gas(&mut self) -> Result<Option<u64>, ZkGasOutcome>;
 
+    /// Returns `true` when committing the current transaction's zk gas would exceed the block
+    /// budget, i.e. when [`Self::commit_transaction_zk_gas`] would fail. Always `false` when no
+    /// meter is installed (pre-Unzen specs).
+    fn transaction_zk_gas_commit_would_exceed(&self) -> bool;
+
     /// Returns the finalized block zk gas that has already been committed.
     fn block_zk_gas_used(&self) -> Option<u64>;
+
+    /// Reserves finalized block zk gas without executing a transaction.
+    ///
+    /// Returns the new finalized block total, or `None` when no meter is installed.
+    fn reserve_block_zk_gas(&mut self, amount: u64) -> Result<Option<u64>, ZkGasOutcome>;
 
     /// Charges the fixed per-transaction intrinsic zk gas defined by the active schedule.
     ///
@@ -108,11 +218,21 @@ where
     I: Inspector<TaikoEvmContext<DB>>,
     P: PrecompileProvider<TaikoEvmContext<DB>, Output = InterpreterResult>,
 {
+    /// Enables or disables the automatic in-flight zk gas reset at the start of every transact.
+    fn set_per_transact_zk_gas_reset_enabled(&mut self, enabled: bool) {
+        self.reset_zk_gas_per_transact = enabled;
+    }
+
     /// Discards any in-flight zk gas recorded for the current transaction.
+    ///
+    /// Covers both metering homes — the production meter on the base EVM and the inspector's
+    /// meter plus its step bookkeeping (only one of the two is ever installed) — so nothing an
+    /// aborted run recorded can charge into the next transaction.
     fn reset_transaction_zk_gas(&mut self) {
-        if let Some(meter) = self.meter_mut() {
+        if let Some(meter) = self.base_evm_mut().zk_gas_meter_mut() {
             meter.reset_transaction();
         }
+        self.base_evm_mut().inner.inspector.reset_transaction();
     }
 
     /// Commits the current transaction's zk gas into the block total and returns the new total.
@@ -124,9 +244,23 @@ where
         Ok(Some(meter.block_zk_gas_used()))
     }
 
+    /// Returns whether committing the current transaction's zk gas would exceed the budget.
+    fn transaction_zk_gas_commit_would_exceed(&self) -> bool {
+        self.meter().is_some_and(|m| m.commit_would_exceed_block_limit())
+    }
+
     /// Returns the finalized block zk gas that has already been committed.
     fn block_zk_gas_used(&self) -> Option<u64> {
         self.meter().map(|m| m.block_zk_gas_used())
+    }
+
+    /// Reserves finalized block zk gas through the active meter.
+    fn reserve_block_zk_gas(&mut self, amount: u64) -> Result<Option<u64>, ZkGasOutcome> {
+        let Some(meter) = self.meter_mut() else {
+            return Ok(None);
+        };
+        meter.reserve_block_budget(amount)?;
+        Ok(Some(meter.block_zk_gas_used()))
     }
 
     /// Charges the fixed per-transaction intrinsic zk gas through the meter.
@@ -207,19 +341,21 @@ where
 
     /// Provides immutable references to the database, inspector and precompiles.
     fn components(&self) -> (&Self::DB, &Self::Inspector, &Self::Precompiles) {
+        let evm = self.base_evm();
         (
-            &self.inner.inner.ctx.journaled_state.database,
-            self.inner.inner.inspector.inner(),
-            &self.inner.inner.precompiles,
+            &evm.inner.ctx.journaled_state.database,
+            evm.inner.inspector.inner(),
+            &evm.inner.precompiles,
         )
     }
 
     /// Provides mutable references to the database, inspector and precompiles.
     fn components_mut(&mut self) -> (&mut Self::DB, &mut Self::Inspector, &mut Self::Precompiles) {
+        let evm = self.base_evm_mut();
         (
-            &mut self.inner.inner.ctx.journaled_state.database,
-            self.inner.inner.inspector.inner_mut(),
-            &mut self.inner.inner.precompiles,
+            &mut evm.inner.ctx.journaled_state.database,
+            evm.inner.inspector.inner_mut(),
+            &mut evm.inner.precompiles,
         )
     }
 
@@ -228,7 +364,32 @@ where
         &mut self,
         tx: Self::Tx,
     ) -> Result<ResultAndState<Self::HaltReason>, Self::Error> {
-        if self.inspect { self.inner.inspect_tx(tx) } else { self.inner.transact(tx) }
+        // RPC callers that reuse one EVM (`eth_estimateGas`'s repeated runs of one transaction,
+        // `eth_callBundle`'s and the intra-block replay helpers' transaction sequences) never
+        // commit the meter, so without a reset the in-flight zk gas of previous runs
+        // accumulates and eventually trips the block budget. The block executor disables this
+        // and manages the per-transaction bracket itself; `eth_simulateV1` and consensus paths
+        // reach the meter through the block executor.
+        if self.reset_zk_gas_per_transact {
+            self.reset_transaction_zk_gas();
+        }
+        self.maybe_derive_anchor_execution_ctx(&tx)?;
+        self.ctx_mut().set_tx(tx);
+        // Run [`TaikoEvmHandler`] against the inner EVM directly so Taiko's anchor and
+        // fee-share semantics apply on both the plain and the inspected path.
+        let mut handler = TaikoEvmHandler::<_, EVMError<DB::Error>, EthFrame<EthInterpreter>>::new(
+            self.base_evm().extra_execution_ctx.clone(),
+        );
+        let result = if self.inspect {
+            handler.inspect_run(&mut self.inner)
+        } else {
+            handler.run(&mut self.inner)
+        };
+        // Finalize before propagating errors, mirroring revm's `ExecuteEvm::transact`: payload
+        // building and derived-block execution skip invalid transactions and keep executing on
+        // this EVM, and an errored run must not leave the journal for the next transaction.
+        let state = self.ctx_mut().journal_mut().finalize();
+        Ok(ResultAndState::new(result?, state))
     }
 
     /// Executes a system call.
@@ -256,7 +417,11 @@ where
             debug!(target: "taiko_evm", "Anchor system call detected: base_fee_share_pctg = {}, caller_nonce = {}", base_fee_share_pctg, caller_nonce);
 
             // Set the Anchor transaction information for the later EVM execution.
-            self.inner.with_extra_execution_context(base_fee_share_pctg, caller, caller_nonce);
+            self.base_evm_mut().with_extra_execution_context(
+                base_fee_share_pctg,
+                caller,
+                caller_nonce,
+            );
 
             // Load both system-call participants through the journal so witness generation can
             // include the same pre-execution dependencies that stateless validation will read
@@ -353,7 +518,8 @@ where
     where
         Self: Sized,
     {
-        let Context { block: block_env, cfg: cfg_env, journaled_state, .. } = self.inner.inner.ctx;
+        let Context { block: block_env, cfg: cfg_env, journaled_state, .. } =
+            self.into_inner().inner.ctx;
 
         (journaled_state.database, EvmEnv { block_env, cfg_env })
     }
@@ -365,7 +531,7 @@ where
         // `create_evm` installs zk-gas on the production TaikoEvm wrapper and keeps the inner
         // inspector unmetered. Enabling the NoOp inspector would route around that production
         // meter, so only EVMs built through `create_evm_with_inspector` may switch to inspect mode.
-        if enabled && self.inner.zk_gas_meter().is_some() {
+        if enabled && self.base_evm().zk_gas_meter().is_some() {
             return;
         }
         self.inspect = enabled;
@@ -373,22 +539,22 @@ where
 
     /// Getter of precompiles.
     fn precompiles(&self) -> &Self::Precompiles {
-        &self.inner.inner.precompiles
+        &self.base_evm().inner.precompiles
     }
 
     /// Mutable getter of precompiles.
     fn precompiles_mut(&mut self) -> &mut Self::Precompiles {
-        &mut self.inner.inner.precompiles
+        &mut self.base_evm_mut().inner.precompiles
     }
 
     /// Getter of inspector.
     fn inspector(&self) -> &Self::Inspector {
-        self.inner.inner.inspector.inner()
+        self.base_evm().inner.inspector.inner()
     }
 
     /// Mutable getter of inspector.
     fn inspector_mut(&mut self) -> &mut Self::Inspector {
-        self.inner.inner.inspector.inner_mut()
+        self.base_evm_mut().inner.inspector.inner_mut()
     }
 }
 
@@ -407,7 +573,11 @@ pub fn decode_anchor_system_call_data(bytes: &Bytes) -> Option<(u64, u64)> {
 mod tests {
     use alloy_evm::{Evm, EvmEnv, EvmFactory};
     use alloy_primitives::U256;
-    use reth_revm::{context::ContextTr, db::InMemoryDB, state::AccountInfo};
+    use reth_revm::{
+        context::{ContextTr, result::InvalidTransaction},
+        db::InMemoryDB,
+        state::AccountInfo,
+    };
 
     use super::*;
     use crate::{factory::TaikoEvmFactory, spec::TaikoSpecId};
@@ -454,7 +624,7 @@ mod tests {
         );
 
         let next_tx_id = journal.transaction_id;
-        assert_eq!(next_tx_id, 1, "synthetic pre-execution load should advance tx id");
+        assert_eq!(next_tx_id.get(), 1, "synthetic pre-execution load should advance tx id");
 
         let golden_touch_account = witness_state
             .get(&golden_touch)
@@ -469,6 +639,240 @@ mod tests {
         assert!(
             treasury_account.is_cold_transaction_id(next_tx_id),
             "treasury must be cold again for the first real transaction"
+        );
+    }
+
+    #[test]
+    fn errored_transaction_finalizes_the_journal_for_the_next_transaction() {
+        // Payload building and derived-block execution skip invalid transactions and keep
+        // executing on the same EVM, so an errored `transact_raw` must leave the journal as
+        // finalized as a successful one — revm's `ExecuteEvm::transact` finalizes
+        // unconditionally for exactly this reason.
+        let broke_caller = Address::with_last_byte(0xBC);
+        let mut env: EvmEnv<TaikoSpecId> = EvmEnv::default();
+        env.cfg_env.chain_id = 167_000;
+        let mut evm = TaikoEvmFactory.create_evm(InMemoryDB::default(), env);
+
+        let tx = TxEnv::builder()
+            .caller(broke_caller)
+            .kind(TxKind::Call(Address::ZERO))
+            // Send value from an unfunded account: validation loads the caller through the
+            // journal and only then errors, so the failed transaction has journal state to
+            // leak. A pre-state error (e.g. a chain-id mismatch) would not exercise this.
+            .value(U256::from(1))
+            .gas_limit(21_000)
+            .chain_id(None)
+            .build()
+            .expect("valid tx env");
+        evm.transact_raw(tx).expect_err("transaction from an unfunded caller must error");
+
+        assert!(
+            evm.ctx().journal().state.is_empty(),
+            "an errored transaction must finalize the journal before the next transaction runs"
+        );
+    }
+
+    /// Golden-touch dust balance observed on mainnet: non-zero, but far below the anchor's
+    /// upfront cost of `gas_limit * gas_price` (`1_000_000 * 10_000_000 = 1e13` wei).
+    const GOLDEN_TOUCH_DUST_BALANCE: u64 = 316_794_861_226;
+
+    /// Basefee used by the replay tests, matching the anchor's gas price (wei).
+    const REPLAY_BASEFEE: u64 = 10_000_000;
+
+    /// Builds an [`EvmEnv`] the way RPC replay paths do: block context only, no anchor
+    /// system call ever happens on the resulting EVM.
+    fn replay_env(chain_id: u64) -> EvmEnv<TaikoSpecId> {
+        let mut env: EvmEnv<TaikoSpecId> = EvmEnv::default();
+        env.cfg_env.chain_id = chain_id;
+        env.block_env.basefee = REPLAY_BASEFEE;
+        env.block_env.gas_limit = 30_000_000;
+        env
+    }
+
+    /// Builds an anchor-shaped transaction: golden touch calling the treasury at the given
+    /// nonce, paying exactly the basefee.
+    fn anchor_tx(treasury: Address, nonce: u64) -> TxEnv {
+        TxEnv::builder()
+            .caller(Address::from(TAIKO_GOLDEN_TOUCH_ADDRESS))
+            .kind(TxKind::Call(treasury))
+            .nonce(nonce)
+            .gas_limit(1_000_000)
+            .gas_price(u128::from(REPLAY_BASEFEE))
+            .chain_id(None)
+            .build()
+            .expect("valid anchor tx env")
+    }
+
+    /// Builds a plain funded-user transfer paying exactly the basefee.
+    fn user_tx(caller: Address, nonce: u64) -> TxEnv {
+        TxEnv::builder()
+            .caller(caller)
+            .kind(TxKind::Call(Address::with_last_byte(0xB0)))
+            .nonce(nonce)
+            .gas_limit(21_000)
+            .gas_price(u128::from(REPLAY_BASEFEE))
+            .chain_id(None)
+            .build()
+            .expect("valid user tx env")
+    }
+
+    /// Seeds a database with the golden-touch account at the given nonce plus an empty
+    /// treasury account, mirroring on-chain pre-block state.
+    fn replay_db(golden_touch_nonce: u64, treasury: Address) -> InMemoryDB {
+        let mut db = InMemoryDB::default();
+        db.insert_account_info(
+            Address::from(TAIKO_GOLDEN_TOUCH_ADDRESS),
+            AccountInfo {
+                nonce: golden_touch_nonce,
+                balance: U256::from(GOLDEN_TOUCH_DUST_BALANCE),
+                ..Default::default()
+            },
+        );
+        db.insert_account_info(treasury, AccountInfo::default());
+        db
+    }
+
+    #[test]
+    fn replayed_anchor_transaction_executes_without_prior_system_call() {
+        // RPC trace/replay paths (`debug_trace*`, `trace_*`) create the EVM straight from the
+        // factory and never issue the anchor system call, so the anchor exemption must be
+        // derivable from the transaction itself plus database state.
+        let chain_id = 167_000;
+        let golden_touch = Address::from(TAIKO_GOLDEN_TOUCH_ADDRESS);
+        let treasury = get_treasury_address(chain_id);
+
+        let mut evm = TaikoEvmFactory.create_evm(replay_db(7, treasury), replay_env(chain_id));
+
+        let result = evm
+            .transact(anchor_tx(treasury, 7))
+            .expect("anchor must execute during replay without a prior anchor system call");
+        assert!(result.result.is_success(), "anchor replay must succeed: {:?}", result.result);
+
+        let golden_touch_state =
+            result.state.get(&golden_touch).expect("golden touch must appear in the state");
+        assert_eq!(
+            golden_touch_state.info.balance,
+            U256::from(GOLDEN_TOUCH_DUST_BALANCE),
+            "anchor must not pay fees during replay"
+        );
+        assert_eq!(golden_touch_state.info.nonce, 8, "anchor must bump the golden touch nonce");
+    }
+
+    #[test]
+    fn derived_anchor_context_only_exempts_the_snapshot_nonce() {
+        // The derived context snapshots the golden-touch nonce before the anchor runs. A
+        // crafted golden-touch -> treasury transaction later in the same block is a normal
+        // transaction under consensus, so the replay must apply the balance check to it.
+        let chain_id = 167_000;
+        let treasury = get_treasury_address(chain_id);
+
+        let mut evm = TaikoEvmFactory.create_evm(replay_db(7, treasury), replay_env(chain_id));
+
+        evm.transact_commit(anchor_tx(treasury, 7)).expect("anchor must execute during replay");
+
+        let err = evm
+            .transact(anchor_tx(treasury, 8))
+            .expect_err("a follow-up golden-touch tx must not inherit the anchor exemption");
+        assert!(
+            matches!(err, EVMError::Transaction(InvalidTransaction::LackOfFundForMaxFee { .. })),
+            "expected a balance-check failure, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn derived_anchor_context_does_not_apply_base_fee_sharing() {
+        // The basefee-share percentage comes from block extra data, which only the
+        // authoritative anchor system call knows. A derived replay context must keep the
+        // pre-existing replay behavior of not redistributing basefee income.
+        let chain_id = 167_000;
+        let treasury = get_treasury_address(chain_id);
+        let alice = Address::with_last_byte(0xA1);
+
+        let mut db = replay_db(7, treasury);
+        db.insert_account_info(
+            alice,
+            AccountInfo { balance: U256::from(10).pow(U256::from(18)), ..Default::default() },
+        );
+        let mut evm = TaikoEvmFactory.create_evm(db, replay_env(chain_id));
+
+        evm.transact_commit(anchor_tx(treasury, 7)).expect("anchor must execute during replay");
+
+        let result = evm.transact(user_tx(alice, 0)).expect("funded user tx must execute");
+        assert!(result.result.is_success(), "user tx must succeed: {:?}", result.result);
+        assert!(
+            result.state.get(&treasury).is_none_or(|account| account.info.balance.is_zero()),
+            "derived context must not route basefee income to the treasury"
+        );
+    }
+
+    #[test]
+    fn fresh_replay_evm_still_exempts_crafted_golden_touch_tx_after_anchor() {
+        // KNOWN LIMITATION, deliberately pinned: reth's tracing helpers create a fresh EVM per
+        // transaction (`debug_traceBlock*`) or for the traced target (`debug_traceTransaction`),
+        // sharing only the database between instances. A fresh EVM created after the real
+        // anchor committed sees the advanced golden-touch nonce and re-derives the anchor
+        // context from it, so a deliberately crafted golden-touch -> treasury transaction
+        // placed later in the block is wrongly exempted here, while consensus executes it as a
+        // fee-paying normal transaction. Real anchors are unaffected in every topology: the
+        // anchor system-call marker commits no state, so a block-start EVM always sees the
+        // pre-anchor nonce.
+        //
+        // Closing this requires the block-start golden-touch nonce (block-position metadata)
+        // to be carried through the EVM environment. When that lands, this test must flip to
+        // assert that the balance check applies to the crafted transaction again.
+        let chain_id = 167_000;
+        let golden_touch = Address::from(TAIKO_GOLDEN_TOUCH_ADDRESS);
+        let treasury = get_treasury_address(chain_id);
+
+        // EVM #1 replays the real anchor (nonce 7) and commits it, advancing the golden-touch
+        // nonce to 8 in the shared database.
+        let mut evm = TaikoEvmFactory.create_evm(replay_db(7, treasury), replay_env(chain_id));
+        evm.transact_commit(anchor_tx(treasury, 7)).expect("anchor must execute during replay");
+        let (db, env) = evm.finish();
+
+        // EVM #2 mirrors tracing a later crafted golden-touch -> treasury transaction: a fresh
+        // instance over the same database. The snapshot protection covered by
+        // `derived_anchor_context_only_exempts_the_snapshot_nonce` does not carry over.
+        let mut fresh_evm = TaikoEvmFactory.create_evm(db, env);
+        let result = fresh_evm
+            .transact(anchor_tx(treasury, 8))
+            .expect("fresh EVM wrongly exempts the crafted tx (see known limitation above)");
+        assert!(result.result.is_success(), "crafted tx executes: {:?}", result.result);
+        assert_eq!(
+            result.state.get(&golden_touch).expect("golden touch state").info.balance,
+            U256::from(GOLDEN_TOUCH_DUST_BALANCE),
+            "fresh EVM grants the fee exemption; consensus would charge gas fees here"
+        );
+    }
+
+    #[test]
+    fn system_call_context_shares_base_fee_for_regular_transactions() {
+        // The authoritative context installed by the anchor system call must keep sharing
+        // basefee income between coinbase and treasury for non-anchor transactions.
+        let chain_id = 167_000;
+        let golden_touch = Address::from(TAIKO_GOLDEN_TOUCH_ADDRESS);
+        let treasury = get_treasury_address(chain_id);
+        let alice = Address::with_last_byte(0xA1);
+
+        let mut db = replay_db(7, treasury);
+        db.insert_account_info(
+            alice,
+            AccountInfo { balance: U256::from(10).pow(U256::from(18)), ..Default::default() },
+        );
+        let mut evm = TaikoEvmFactory.create_evm(db, replay_env(chain_id));
+
+        evm.transact_system_call(golden_touch, treasury, encode_anchor_system_call_data(25, 7))
+            .expect("anchor system call must succeed");
+
+        let result = evm.transact(user_tx(alice, 0)).expect("funded user tx must execute");
+        assert!(result.result.is_success(), "user tx must succeed: {:?}", result.result);
+
+        let base_fee_income = U256::from(21_000u64) * U256::from(REPLAY_BASEFEE);
+        let coinbase_share = base_fee_income * U256::from(25u64) / U256::from(100u64);
+        assert_eq!(
+            result.state.get(&treasury).expect("treasury must be rewarded").info.balance,
+            base_fee_income - coinbase_share,
+            "treasury must receive the non-coinbase share of the basefee income"
         );
     }
 }
