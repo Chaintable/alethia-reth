@@ -30,9 +30,7 @@ use reth::{
     tasks::{Runtime, pool::BlockingTaskPool},
 };
 use reth_chain_state::CanonStateNotification;
-use reth_ethereum_primitives::{
-    EthPrimitives, Receipt, TransactionSigned, calculate_receipt_root_no_memo,
-};
+use reth_ethereum_primitives::{EthPrimitives, Receipt, TransactionSigned};
 use reth_evm::{
     ConfigureEvm,
     block::{BlockExecutor, TxResult},
@@ -51,7 +49,7 @@ use reth_rpc_eth_types::{EthStateCache, cache::cache_new_blocks_task};
 use reth_transaction_pool::test_utils::testing_pool;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use reth_trie_common::{AccountProof, DecodedMultiProofV2, StorageProof, TrieAccount};
-use reth_trie_sparse::{LeafUpdate, SparseStateTrie};
+use reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie, TrieNodeEpoch};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -466,7 +464,11 @@ fn assert_bundle_witness_coverage(bundle: &BundleState, proofs: &StateProofsFixt
     assert!(missing.is_empty(), "bundle state is absent from the witness: {missing:?}");
 }
 
-fn sparse_root(decoded_proof: DecodedMultiProofV2, post_state: &HashedPostState) -> B256 {
+fn sparse_root(
+    decoded_proof: DecodedMultiProofV2,
+    post_state: &HashedPostState,
+    wipes: &[B256],
+) -> B256 {
     let mut trie = SparseStateTrie::new();
     trie.reveal_decoded_multiproof_v2(decoded_proof).expect("reveal the verified parent proof");
 
@@ -489,10 +491,10 @@ fn sparse_root(decoded_proof: DecodedMultiProofV2, post_state: &HashedPostState)
         );
     }
 
+    for address in wipes {
+        trie.insert_storage_trie(*address, RevealableSparseTrie::revealed_empty());
+    }
     for (address, storage) in &post_state.storages {
-        if storage.wiped {
-            trie.wipe_storage(*address).expect("wipe revealed storage");
-        }
         let mut updates = B256Map::from_iter(storage.storage.iter().map(|(slot, value)| {
             let encoded = if value.is_zero() {
                 Vec::new()
@@ -510,15 +512,16 @@ fn sparse_root(decoded_proof: DecodedMultiProofV2, post_state: &HashedPostState)
         let encoded = match account {
             None => Vec::new(),
             Some(account) => {
-                let storage_root = trie.storage_root(address).unwrap_or_else(|| {
-                    trie.get_account_value(address)
-                        .map(|value| {
-                            TrieAccount::decode(&mut &value[..])
-                                .expect("decode revealed account leaf")
-                                .storage_root
-                        })
-                        .unwrap_or(EMPTY_ROOT_HASH)
-                });
+                let storage_root =
+                    trie.storage_root(address, TrieNodeEpoch::new(1)).unwrap_or_else(|| {
+                        trie.get_account_value(address)
+                            .map(|value| {
+                                TrieAccount::decode(&mut &value[..])
+                                    .expect("decode revealed account leaf")
+                                    .storage_root
+                            })
+                            .unwrap_or(EMPTY_ROOT_HASH)
+                    });
                 if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
                     Vec::new()
                 } else {
@@ -532,7 +535,7 @@ fn sparse_root(decoded_proof: DecodedMultiProofV2, post_state: &HashedPostState)
             .expect("update revealed account leaf");
         assert!(updates.is_empty(), "account update needs an unrevealed proof");
     }
-    trie.root().expect("calculate sparse state root without database fallback")
+    trie.root(TrieNodeEpoch::new(1)).expect("calculate sparse state root without database fallback")
 }
 
 async fn cache_replay_block(
@@ -704,7 +707,7 @@ async fn trace_fixture_through_handler(
     assert_eq!(decoded_diff.hash, rpc_block.header.state_root);
     let decoded_proof = verified_decoded_proof(&proofs, parent.header.state_root);
     assert_eq!(
-        sparse_root(decoded_proof, &decoded_state),
+        sparse_root(decoded_proof, &decoded_state, &decoded_diff.deleted_accounts),
         rpc_block.header.state_root,
         "handler state_diff must independently rebuild the canonical root"
     );
@@ -726,7 +729,7 @@ fn replay_fixture(network: FixtureNetwork, height: u64) -> BlockStorageDiff {
 
     let stored_receipts = decode_receipts(network, height, block.hash());
     assert_eq!(stored_receipts.len(), block.body().transactions.len());
-    assert_eq!(calculate_receipt_root_no_memo(&stored_receipts), block.receipts_root());
+    assert_eq!(Receipt::calculate_receipt_root_no_memo(&stored_receipts), block.receipts_root());
     assert_eq!(
         logs_bloom(stored_receipts.iter().flat_map(|receipt| &receipt.logs)),
         block.logs_bloom()
@@ -766,7 +769,13 @@ fn replay_fixture(network: FixtureNetwork, height: u64) -> BlockStorageDiff {
     assert_bundle_witness_coverage(&bundle, &proofs);
     let replay_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
     let decoded_proof = verified_decoded_proof(&proofs, parent.header.state_root);
-    let root_a = sparse_root(decoded_proof.clone(), &replay_state);
+    let wipes = bundle
+        .state
+        .iter()
+        .filter(|(_, account)| account.was_destroyed())
+        .map(|(address, _)| alloy_primitives::keccak256(address))
+        .collect::<Vec<_>>();
+    let root_a = sparse_root(decoded_proof.clone(), &replay_state, &wipes);
     assert_eq!(root_a, rpc_block.header.state_root);
 
     let state_diff =
@@ -774,7 +783,7 @@ fn replay_fixture(network: FixtureNetwork, height: u64) -> BlockStorageDiff {
     let wire = alloy_rlp::encode(&state_diff);
     let decoded_state = decode_and_validate_storage_diff_exact(&wire, &state_diff)
         .expect("decode exact state diff");
-    let root_b = sparse_root(decoded_proof, &decoded_state);
+    let root_b = sparse_root(decoded_proof, &decoded_state, &state_diff.deleted_accounts);
     assert_eq!(root_b, root_a);
     assert_eq!(root_b, rpc_block.header.state_root);
     state_diff

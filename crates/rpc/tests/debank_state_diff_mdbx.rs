@@ -2,6 +2,7 @@
 
 use alethia_reth_rpc::debank::{
     build_storage_diff, decode_and_validate_storage_diff_exact, hashed_address, hashed_slot,
+    materialize_storage_wipes,
 };
 use alloy_consensus::constants::KECCAK_EMPTY;
 use alloy_genesis::{Genesis, GenesisAccount};
@@ -10,6 +11,7 @@ use reth::{
     chainspec::ChainSpecBuilder,
     providers::test_utils::{create_test_provider_factory_with_chain_spec, insert_genesis},
 };
+use reth_provider::HashedPostStateProvider;
 use reth_revm::{
     db::{
         AccountStatus, BundleAccount, BundleState,
@@ -17,7 +19,7 @@ use reth_revm::{
     },
     state::{AccountInfo, Bytecode},
 };
-use reth_trie::{HashedPostState, KeccakKeyHasher};
+use reth_trie::HashedPostState;
 use std::{collections::BTreeMap, sync::Arc};
 
 fn word(value: u64) -> B256 {
@@ -159,7 +161,8 @@ fn decoded_state_diff_matches_replay_and_independent_final_mdbx_trie() {
         bundle.contracts.insert(keccak256(&code), Bytecode::new_raw(code));
     }
 
-    let replay_state = HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+    let replay_state =
+        parent_state.hashed_post_state(&bundle).expect("hash replay with parent-slot zeroes");
     let root_a = parent_state.state_root(replay_state).expect("compute replay root A");
     assert_eq!(root_a, expected_final_root);
 
@@ -197,8 +200,16 @@ fn decoded_state_diff_matches_replay_and_independent_final_mdbx_trie() {
     let encoded = alloy_rlp::encode(&diff);
     let decoded_state =
         decode_and_validate_storage_diff_exact(&encoded, &diff).expect("decode exact state diff");
-    assert!(decoded_state.storages[&hashed_address(deleted)].wiped);
-    assert!(decoded_state.storages[&hashed_address(recreated)].wiped);
+    let decoded_state = materialize_storage_wipes(decoded_state, &diff, &bundle, &*parent_state)
+        .expect("materialize decoded wipes");
+    assert_eq!(
+        decoded_state.storages[&hashed_address(deleted)].storage[&hashed_slot(U256::from(4))],
+        U256::ZERO
+    );
+    assert_eq!(
+        decoded_state.storages[&hashed_address(recreated)].storage[&hashed_slot(U256::from(7))],
+        U256::ZERO
+    );
 
     let root_b = parent_state.state_root(decoded_state).expect("compute decoded root B");
     assert_eq!(root_b, root_a);
