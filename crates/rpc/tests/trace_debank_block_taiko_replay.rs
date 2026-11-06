@@ -49,7 +49,7 @@ use reth_rpc_eth_types::{EthStateCache, cache::cache_new_blocks_task};
 use reth_transaction_pool::test_utils::testing_pool;
 use reth_trie::{HashedPostState, KeccakKeyHasher};
 use reth_trie_common::{AccountProof, DecodedMultiProofV2, StorageProof, TrieAccount};
-use reth_trie_sparse::{LeafUpdate, SparseStateTrie};
+use reth_trie_sparse::{LeafUpdate, RevealableSparseTrie, SparseStateTrie, TrieNodeEpoch};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::{
@@ -492,7 +492,7 @@ fn sparse_root(
     }
 
     for address in wipes {
-        trie.wipe_storage(*address).expect("wipe revealed storage");
+        trie.insert_storage_trie(*address, RevealableSparseTrie::revealed_empty());
     }
     for (address, storage) in &post_state.storages {
         let mut updates = B256Map::from_iter(storage.storage.iter().map(|(slot, value)| {
@@ -512,15 +512,16 @@ fn sparse_root(
         let encoded = match account {
             None => Vec::new(),
             Some(account) => {
-                let storage_root = trie.storage_root(address).unwrap_or_else(|| {
-                    trie.get_account_value(address)
-                        .map(|value| {
-                            TrieAccount::decode(&mut &value[..])
-                                .expect("decode revealed account leaf")
-                                .storage_root
-                        })
-                        .unwrap_or(EMPTY_ROOT_HASH)
-                });
+                let storage_root =
+                    trie.storage_root(address, TrieNodeEpoch::new(1)).unwrap_or_else(|| {
+                        trie.get_account_value(address)
+                            .map(|value| {
+                                TrieAccount::decode(&mut &value[..])
+                                    .expect("decode revealed account leaf")
+                                    .storage_root
+                            })
+                            .unwrap_or(EMPTY_ROOT_HASH)
+                    });
                 if account.is_empty() && storage_root == EMPTY_ROOT_HASH {
                     Vec::new()
                 } else {
@@ -534,7 +535,7 @@ fn sparse_root(
             .expect("update revealed account leaf");
         assert!(updates.is_empty(), "account update needs an unrevealed proof");
     }
-    trie.root().expect("calculate sparse state root without database fallback")
+    trie.root(TrieNodeEpoch::new(1)).expect("calculate sparse state root without database fallback")
 }
 
 async fn cache_replay_block(
