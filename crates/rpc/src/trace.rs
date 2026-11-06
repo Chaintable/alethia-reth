@@ -5,7 +5,7 @@ use crate::{
         BlockFile, DebankBlock, DebankOutput, DebankTransaction, build_debank_traces,
         build_genesis_storage_diff, build_rpc_header, build_storage_diff, complete_state_root,
         decode_and_validate_storage_diff_exact, genesis_storage_contracts,
-        observed_storage_contracts,
+        materialize_storage_wipes, observed_storage_contracts,
     },
     geth_error::{GethErrorInspector, PrecompileErrorCapture},
     proof_state::ProofHistoryStateProviderFactory,
@@ -27,15 +27,15 @@ use reth_evm::{ConfigureEvm, Evm, block::BlockExecutor};
 use reth_optimism_trie::OpProofsStore;
 use reth_primitives_traits::{BlockBody, RecoveredBlock, logs_bloom};
 use reth_provider::{
-    BlockHashReader, ChainSpecProvider, HeaderProvider, StateProvider, StateProviderFactory,
-    StateRootProvider,
+    BlockHashReader, ChainSpecProvider, HashedPostStateProvider, HeaderProvider, StateProvider,
+    StateProviderFactory, StateRootProvider,
 };
 use reth_revm::{
     State, database::StateProviderDatabase, db::states::bundle_state::BundleRetention,
 };
 use reth_rpc_eth_api::{RpcNodeCore, helpers::FullEthApi};
 use reth_tasks::pool::BlockingTaskGuard;
-use reth_trie::{HashedPostState, KeccakKeyHasher};
+use reth_trie::HashedPostState;
 use revm_inspectors::tracing::{OpcodeFilter, TracingInspector, TracingInspectorConfig};
 use serde_json::value::RawValue;
 use std::{sync::Arc, time::Duration};
@@ -894,8 +894,9 @@ where
                     let bundle = state.take_bundle();
                     let replay_root = if verify_state_roots {
                         check_cancelled(&cancel, "before replay state root")?;
-                        let hashed =
-                            HashedPostState::from_bundle_state::<KeccakKeyHasher>(bundle.state());
+                        let hashed = state_provider.hashed_post_state(&bundle).map_err(|error| {
+                            rpc_error(EXECUTION_CONSENSUS_MISMATCH, "EXECUTION_CONSENSUS_MISMATCH", error)
+                        })?;
                         let root = state_provider.state_root(hashed).map_err(|error| {
                             rpc_error(
                                 EXECUTION_CONSENSUS_MISMATCH,
@@ -966,6 +967,19 @@ where
                     }
                     if let Some(root_a) = replay_root {
                         check_cancelled(&cancel, "before decoded state root")?;
+                        let decoded_state = materialize_storage_wipes(
+                            decoded_state,
+                            &state_diff,
+                            &bundle,
+                            &*state_provider,
+                        )
+                        .map_err(|error| {
+                            rpc_error(
+                                EXECUTION_CONSENSUS_MISMATCH,
+                                "EXECUTION_CONSENSUS_MISMATCH",
+                                error,
+                            )
+                        })?;
                         let root_b = state_provider.state_root(decoded_state).map_err(|error| {
                             rpc_error(
                                 EXECUTION_CONSENSUS_MISMATCH,
@@ -1063,7 +1077,7 @@ fn validate_stored_consensus(
 ) -> RpcResult<()> {
     let transactions = BlockBody::transactions(block.body());
     let tx_root = alloy_consensus::proofs::calculate_transaction_root(transactions);
-    let receipt_root = reth_ethereum_primitives::calculate_receipt_root_no_memo(receipts);
+    let receipt_root = reth_ethereum_primitives::Receipt::calculate_receipt_root_no_memo(receipts);
     let receipt_bloom = logs_bloom(receipts.iter().flat_map(|receipt| receipt.logs()));
     let cumulative_gas = receipts.last().map_or(0, TxReceipt::cumulative_gas_used);
     let ommers_are_empty =
@@ -1341,9 +1355,8 @@ mod tests {
                     transactions_root: alloy_consensus::proofs::calculate_transaction_root(
                         &transactions,
                     ),
-                    receipts_root: reth_ethereum_primitives::calculate_receipt_root_no_memo(
-                        &receipts,
-                    ),
+                    receipts_root:
+                        reth_ethereum_primitives::Receipt::calculate_receipt_root_no_memo(&receipts),
                     withdrawals_root: Some(EMPTY_WITHDRAWALS),
                     logs_bloom: Bloom::ZERO,
                     difficulty: U256::ZERO,
@@ -1451,9 +1464,8 @@ mod tests {
                     transactions_root: alloy_consensus::proofs::calculate_transaction_root(
                         &transactions,
                     ),
-                    receipts_root: reth_ethereum_primitives::calculate_receipt_root_no_memo(
-                        &receipts,
-                    ),
+                    receipts_root:
+                        reth_ethereum_primitives::Receipt::calculate_receipt_root_no_memo(&receipts),
                     withdrawals_root: Some(EMPTY_WITHDRAWALS),
                     logs_bloom: Bloom::ZERO,
                     difficulty: U256::ZERO,

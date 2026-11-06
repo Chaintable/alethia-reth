@@ -1076,6 +1076,8 @@ pub fn genesis_storage_contracts(genesis: &alloy_genesis::Genesis) -> Vec<Addres
 ///
 /// Duplicate accounts, deletions, storage entries, code entries, orphan code,
 /// and trailing RLP bytes are rejected before root computation.
+/// Storage wipes remain in `deleted_accounts`; call [`materialize_storage_wipes`] before
+/// computing a database-backed root, since reth v2.6 requires explicit parent-slot zeroes.
 pub fn decode_storage_diff_exact(
     encoded: &[u8],
 ) -> Result<(BlockStorageDiff, reth_trie::HashedPostState), String> {
@@ -1158,10 +1160,10 @@ pub fn decode_storage_diff_exact(
         );
     let mut hashed_storages = deleted
         .iter()
-        .map(|address| (*address, HashedStorage::new(true)))
+        .map(|address| (*address, HashedStorage::default()))
         .collect::<BTreeMap<_, _>>();
     for (address, slots) in storages {
-        let storage = hashed_storages.entry(address).or_insert_with(|| HashedStorage::new(false));
+        let storage = hashed_storages.entry(address).or_default();
         storage.storage.extend(slots);
     }
     let state = reth_trie::HashedPostState::default()
@@ -1184,6 +1186,47 @@ pub fn decode_and_validate_storage_diff_exact(
         return Err("decoded state diff differs from the replay-derived expected set".into());
     }
     Ok(state)
+}
+
+/// Expands decoded storage wipes into reth v2.6's explicit parent-slot zeroes.
+///
+/// The replay bundle supplies only address preimages for the wire's hashed deletion keys.
+/// Values come from the parent provider and the decoded diff, never replay's final storage.
+/// Recreated-account writes override the parent-slot zeroes. Missing preimages fail closed.
+pub fn materialize_storage_wipes(
+    state: reth_trie::HashedPostState,
+    diff: &BlockStorageDiff,
+    bundle: &reth_revm::db::BundleState,
+    parent: &dyn reth_provider::StateProvider,
+) -> Result<reth_trie::HashedPostState, String> {
+    use reth_revm::{
+        db::{AccountStatus, BundleAccount, BundleState},
+        state::AccountInfo,
+    };
+
+    if diff.deleted_accounts.is_empty() {
+        return Ok(state);
+    }
+    let mut wipes = BundleState::default();
+    for hashed in &diff.deleted_accounts {
+        let address = bundle
+            .state
+            .keys()
+            .find(|address| hashed_address(**address) == *hashed)
+            .ok_or_else(|| format!("missing deleted-account preimage {hashed}"))?;
+        wipes.state.insert(
+            *address,
+            BundleAccount::new(
+                Some(AccountInfo::default()),
+                None,
+                Default::default(),
+                AccountStatus::Destroyed,
+            ),
+        );
+    }
+    let mut materialized = parent.hashed_post_state(&wipes).map_err(|error| error.to_string())?;
+    materialized.extend(state);
+    Ok(materialized)
 }
 
 /// Computes a state root when the diff describes the entire state, as Genesis does.
@@ -2006,8 +2049,8 @@ mod tests {
             new_codes: Vec::new(),
         };
 
-        let (_, state) = decode_storage_diff_exact(&alloy_rlp::encode(diff)).unwrap();
-        assert!(state.storages[&address].wiped);
+        let (decoded, state) = decode_storage_diff_exact(&alloy_rlp::encode(diff)).unwrap();
+        assert!(decoded.deleted_accounts.contains(&address));
         assert!(state.storages[&address].storage.is_empty());
         assert!(state.accounts[&address].is_some());
     }
@@ -2058,8 +2101,9 @@ mod tests {
         assert_eq!(diff.deleted_accounts, vec![hashed_address(address)]);
         assert!(diff.new_accounts.is_empty());
         assert!(diff.storage_diffs.is_empty());
-        let (_, state) = decode_storage_diff_exact(&alloy_rlp::encode(diff)).unwrap();
-        assert!(state.storages[&hashed_address(address)].wiped);
+        let (decoded, state) = decode_storage_diff_exact(&alloy_rlp::encode(diff)).unwrap();
+        assert!(decoded.deleted_accounts.contains(&hashed_address(address)));
+        assert!(state.storages.contains_key(&hashed_address(address)));
     }
 
     #[test]
@@ -2139,8 +2183,9 @@ mod tests {
         assert_eq!(diff.new_accounts.len(), 1);
         assert_eq!(diff.storage_diffs.len(), 1);
         assert_eq!(diff.storage_diffs[0].diffs.len(), 2);
-        let (_, state) = decode_storage_diff_exact(&alloy_rlp::encode(diff)).unwrap();
-        assert!(state.storages[&hashed_address(address)].wiped);
+        let (decoded, state) = decode_storage_diff_exact(&alloy_rlp::encode(diff)).unwrap();
+        assert!(decoded.deleted_accounts.contains(&hashed_address(address)));
+        assert!(state.storages.contains_key(&hashed_address(address)));
         assert_eq!(state.storages[&hashed_address(address)].storage.len(), 2);
     }
 

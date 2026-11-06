@@ -22,8 +22,8 @@ alethia-reth-evm = { path = "../evm" }
 alethia-reth-primitives = { path = "../primitives", features = ["serde"] }
 alethia-reth-rpc-types = { path = "../rpc-types" }
 alloy-consensus = { workspace = true }
-alloy-genesis = { workspace = true }
 alloy-eips = { workspace = true }
+alloy-genesis = { workspace = true }
 alloy-hardforks = { workspace = true }
 alloy-json-rpc = { workspace = true }
 alloy-primitives = { workspace = true }
@@ -38,9 +38,10 @@ hash-db = { workspace = true }
 jsonrpsee = { workspace = true, features = ["macros", "server", "client"] }
 jsonrpsee-core = { workspace = true }
 jsonrpsee-types = { workspace = true }
+md5 = { workspace = true }
 op-alloy-flz = { workspace = true }
+plain_hasher = { workspace = true }
 reth = { workspace = true }
-reth-chain-state = { workspace = true }
 reth-db = { workspace = true }
 reth-db-api = { workspace = true }
 reth-engine-primitives = { workspace = true }
@@ -64,19 +65,18 @@ reth-rpc-convert = { workspace = true }
 reth-rpc-engine-api = { workspace = true }
 reth-rpc-eth-api = { workspace = true }
 reth-rpc-eth-types = { workspace = true }
+reth-storage-overlay = { workspace = true }
 reth-tasks = { workspace = true }
-reth-trie-common = { workspace = true, features = ["serde"] }
 reth-trie = { workspace = true }
-triehash = { workspace = true }
+reth-trie-common = { workspace = true, features = ["serde"] }
 revm-inspectors = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 sha1 = { workspace = true }
-md5 = { workspace = true }
-plain_hasher = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+triehash = { workspace = true }
 
 [dev-dependencies]
 alloy-signer = { workspace = true }
@@ -86,6 +86,7 @@ reth-chain-state = { workspace = true }
 reth-execution-types = { workspace = true }
 reth-provider = { workspace = true, features = ["test-utils"] }
 reth-transaction-pool = { workspace = true, features = ["test-utils"] }
+reth-trie = { workspace = true, features = ["test-utils"] }
 reth-trie-sparse = { workspace = true }
 sha2 = { workspace = true }
 socket2 = { workspace = true }
